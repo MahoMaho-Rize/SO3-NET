@@ -115,20 +115,18 @@ def auxiliary_support_bce(support_pred, support_gt, reduction="mean"):
     """
     Binary cross-entropy loss for per-point support classification.
 
-    This is an auxiliary task that provides:
-    1. Interpretability (which points are predicted as support)
-    2. Regularization (additional supervision signal)
-    3. Fair comparison with original UprightNet
+    Uses binary_cross_entropy_with_logits for numerical stability
+    (avoids log(0) when sigmoid saturates to 0 or 1).
 
     Args:
-        support_pred: (N,) predicted support probability in [0, 1]
+        support_pred: (N,) raw logits (before sigmoid)
         support_gt:   (N,) ground truth support labels (0 or 1)
         reduction:    'mean', 'sum', or 'none'
 
     Returns:
         loss: scalar
     """
-    return F.binary_cross_entropy(
+    return F.binary_cross_entropy_with_logits(
         support_pred,
         support_gt.float(),
         reduction=reduction,

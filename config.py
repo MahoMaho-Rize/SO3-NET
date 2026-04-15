@@ -79,23 +79,23 @@ parser.add_argument(
 parser.add_argument(
     "--num_neighbors",
     type=float,
-    default=20.0,
-    help="average number of neighbors for normalization",
+    default=32.0,
+    help="number of KNN neighbors for graph construction",
 )
 parser.add_argument(
     "--irreps_hidden",
     type=str,
-    default="32x0e+16x1o+8x2e",
+    default="128x0e+64x1o",
     help="hidden layer irreducible representations",
 )
 parser.add_argument(
     "--equi_layers",
     type=int,
-    default=4,
+    default=6,
     help="number of equivariant message passing layers",
 )
 parser.add_argument(
-    "--radial_neurons", type=int, default=64, help="radial MLP hidden size"
+    "--radial_neurons", type=int, default=128, help="radial MLP hidden size"
 )
 parser.add_argument(
     "--conv_type",
@@ -104,7 +104,7 @@ parser.add_argument(
     help="convolution type: fctp (full CG tensor product) or depthwise (MACE-style separable)",
 )
 parser.add_argument(
-    "--num_radial_basis", type=int, default=10, help="number of radial basis functions"
+    "--num_radial_basis", type=int, default=16, help="number of radial basis functions"
 )
 
 # loss
@@ -123,7 +123,7 @@ parser.add_argument(
 parser.add_argument(
     "--vmf_kappa_init",
     type=float,
-    default=10.0,
+    default=1.0,
     help="initial vMF concentration parameter",
 )
 
@@ -133,6 +133,12 @@ parser.add_argument(
     type=str2bool,
     default=True,
     help="use rotation augmentation (set False for equivariant model)",
+)
+parser.add_argument(
+    "--num_rotations",
+    type=int,
+    default=100,
+    help="number of rotations per object: 100 (full), 10, 5, or 0 (no aug)",
 )
 
 opts = parser.parse_args()

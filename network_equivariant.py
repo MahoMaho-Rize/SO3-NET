@@ -27,10 +27,16 @@ import torch.nn.functional as F
 
 from e3nn import o3
 from e3nn.math import soft_one_hot_linspace
-from e3nn.nn import Gate, FullyConnectedNet
+from e3nn.nn import Gate, FullyConnectedNet, BatchNorm as e3nn_BatchNorm
+from e3nn.o3 import ToS2Grid, FromS2Grid
 
-from torch_cluster import radius_graph
+from torch_cluster import radius_graph, knn_graph
 from torch_scatter import scatter
+
+# Try to use NVIDIA cuEquivariance for fused CUDA tensor product kernels (~4x speedup)
+# cuEquivariance disabled: transpose overhead incompatible with large point clouds.
+# Using torch.compile on e3nn TensorProduct for ~2x speedup instead.
+HAS_CUET = False
 
 
 # ============================================================
@@ -208,6 +214,120 @@ def _build_depthwise_tp_instructions(irreps_in, irreps_sh, target_irreps):
     return irreps_mid, instructions
 
 
+# ============================================================
+# Nonlinearity: Separable S² Activation
+# ============================================================
+
+
+class SeparableS2Activation(nn.Module):
+    """
+    Separable S² activation for equivariant features.
+
+    Applies true pointwise nonlinearity on the sphere, enabling nonlinear mixing
+    between different angular momentum degrees (l values). This is fundamentally
+    more expressive than Gate, which can only scale vectors by scalars.
+
+    Design (following EquiformerV2):
+        - Scalar path (l=0): direct SiLU activation (exact, stable)
+        - Higher-order path (l>0): iSHT → pointwise SiLU → SHT
+        - Separating the paths avoids gradient instability
+
+    Math:
+        For the higher-order path:
+            f_grid(β, α) = Σ_{l,m} F^l_m · Y^l_m(β, α)     [iSHT]
+            g_grid(β, α) = σ(f_grid(β, α))                    [pointwise nonlinearity]
+            G^l_m = ∫ g_grid(β, α) · Y^l_m(β, α) dΩ          [SHT]
+
+        Equivariance: rotation permutes grid points, pointwise ops commute
+        with permutation, so the composition is equivariant.
+
+    Args:
+        irreps_in:  input irreps (e.g., "128x0e+128x1o")
+        act:        activation function (default: SiLU)
+        res_multiplier: grid resolution multiplier (default: 2, higher = less aliasing)
+    """
+
+    def __init__(self, irreps_in, act=F.silu, res_multiplier=2):
+        super().__init__()
+        irreps_in = o3.Irreps(irreps_in)
+        self.irreps_in = irreps_in
+        self.irreps_out = irreps_in
+        self.act = act
+
+        # Require uniform multiplicity
+        mul_set = set(m for m, _ in irreps_in)
+        assert len(mul_set) == 1, "SeparableS2Activation requires uniform multiplicity"
+        self.mul = mul_set.pop()
+
+        # Find lmax
+        self.lmax = max(ir.l for _, ir in irreps_in)
+        self.coeff_dim = (self.lmax + 1) ** 2
+
+        # S² grid transforms (square grid for proper resolution in both β and α)
+        # res=8 for L=1 gives ~5e-7 equivariance error
+        # res=10 for L=2 gives ~1e-7 equivariance error
+        grid_res = max(8, res_multiplier * (self.lmax + 1))
+        self.to_s2 = ToS2Grid(
+            lmax=self.lmax,
+            res=(grid_res, grid_res),
+            normalization="component",
+        )
+        self.from_s2 = FromS2Grid(
+            res=(grid_res, grid_res),
+            lmax=self.lmax,
+            normalization="component",
+        )
+
+        # Build mapping: for each (mul, ir) block, where its coefficients
+        # go in the (lmax+1)² SH vector
+        # e3nn irreps order: "128x0e + 128x1o" = [0e]*128 + [1o]*128
+        # SH vector order: [Y_0^0, Y_1^{-1}, Y_1^0, Y_1^1] per multiplicity
+        self._block_info = []  # (feat_start, feat_end, sh_start, sh_end, mul)
+        feat_idx = 0
+        for mul, ir in irreps_in:
+            l = ir.l
+            dim = 2 * l + 1
+            block_dim = mul * dim
+            sh_start = l * l  # position of degree l in (lmax+1)² layout
+            self._block_info.append(
+                (feat_idx, feat_idx + block_dim, sh_start, sh_start + dim, mul)
+            )
+            feat_idx += block_dim
+
+    def forward(self, x):
+        """
+        Args:
+            x: (num_nodes, irreps_in.dim) equivariant features
+
+        Returns:
+            y: (num_nodes, irreps_out.dim) activated features
+        """
+        N = x.shape[0]
+        mul = self.mul
+
+        # Assemble SH coefficient tensor: (N, mul, (lmax+1)²)
+        coeffs = x.new_zeros(N, mul, self.coeff_dim)
+        for feat_start, feat_end, sh_start, sh_end, m in self._block_info:
+            dim = sh_end - sh_start
+            coeffs[:, :, sh_start:sh_end] = x[:, feat_start:feat_end].reshape(N, m, dim)
+
+        # Reshape to (N*mul, coeff_dim)
+        coeffs_flat = coeffs.reshape(N * mul, self.coeff_dim)
+
+        # iSHT → pointwise activation → SHT
+        grid = self.to_s2(coeffs_flat)
+        grid = self.act(grid)
+        coeffs_out = self.from_s2(grid).reshape(N, mul, self.coeff_dim)
+
+        # Scatter back to output tensor
+        y = torch.zeros_like(x)
+        for feat_start, feat_end, sh_start, sh_end, m in self._block_info:
+            dim = sh_end - sh_start
+            y[:, feat_start:feat_end] = coeffs_out[:, :, sh_start:sh_end].reshape(N, -1)
+
+        return y
+
+
 class EfficientConvLayer(nn.Module):
     """
     MACE-style depthwise separable equivariant convolution layer.
@@ -260,62 +380,46 @@ class EfficientConvLayer(nn.Module):
         irreps_out = o3.Irreps(irreps_out)
         irreps_sh = o3.Irreps(irreps_sh)
 
-        # --- Build Gate (same logic as EquivariantConvLayer) ---
-        irreps_scalars = o3.Irreps(
-            [(mul, ir) for mul, ir in irreps_out if ir.l == 0]
-        )
-        irreps_gated = o3.Irreps(
-            [(mul, ir) for mul, ir in irreps_out if ir.l > 0]
-        )
-        irreps_gates = o3.Irreps(
-            [(mul, (0, 1)) for mul, ir in irreps_gated]
-        )
+        # --- Nonlinearity: S² activation ---
+        self.s2_act = SeparableS2Activation(irreps_out)
 
-        act_scalars = []
-        for _, ir in irreps_scalars:
-            if ir.p == 1:
-                act_scalars.append(torch.nn.functional.silu)
-            else:
-                act_scalars.append(torch.tanh)
-        act_gates = [torch.sigmoid for _ in irreps_gates]
-
-        self.gate = Gate(
-            irreps_scalars, act_scalars,
-            irreps_gates, act_gates,
-            irreps_gated,
-        )
-        irreps_conv_out = self.gate.irreps_in
-
-        # --- Step 1: Pre-TP linear (channel mixing, shared weights) ---
+        # --- Step 1: Pre-TP linear ---
         self.linear_up = o3.Linear(irreps_in, irreps_in)
 
-        # --- Step 2: Depthwise tensor product ("uvu" mode) ---
-        # Build instructions: only CG-valid paths, output mul = input mul
+        # --- Step 2: Depthwise tensor product ---
         irreps_mid, instructions = _build_depthwise_tp_instructions(
-            irreps_in, irreps_sh, target_irreps=irreps_out,
+            irreps_in,
+            irreps_sh,
+            target_irreps=irreps_out,
         )
-
         self.tp = o3.TensorProduct(
-            irreps_in, irreps_sh, irreps_mid,
+            irreps_in,
+            irreps_sh,
+            irreps_mid,
             instructions=instructions,
             shared_weights=False,
             internal_weights=False,
         )
+        # torch.compile for ~2x TP speedup
+        self.tp = torch.compile(self.tp)
 
-        # --- Radial MLP (now outputs TINY weight vector, e.g. ~11 for L=2) ---
+        # --- Radial MLP ---
         self.radial_mlp = FullyConnectedNet(
             [num_radial_basis, radial_neurons, self.tp.weight_numel],
             act=torch.nn.functional.silu,
         )
 
-        # --- Step 3: Post-TP linear (channel mixing, shared weights) ---
-        self.linear_down = o3.Linear(irreps_mid, irreps_conv_out)
+        # --- Step 3: Post-TP linear ---
+        self.linear_down = o3.Linear(irreps_mid, irreps_out)
 
         # --- Self-connection (skip) ---
-        self.self_connection = o3.Linear(irreps_in, irreps_conv_out)
+        self.self_connection = o3.Linear(irreps_in, irreps_out)
+
+        # --- Equivariant batch normalization ---
+        self.batch_norm = e3nn_BatchNorm(irreps_out)
 
         self.irreps_in = irreps_in
-        self.irreps_out = self.gate.irreps_out
+        self.irreps_out = irreps_out
 
     def forward(self, node_features, edge_index, edge_sh, edge_length_embedded):
         """
@@ -330,10 +434,10 @@ class EfficientConvLayer(nn.Module):
         """
         edge_src, edge_dst = edge_index
 
-        # Step 1: Channel mixing (shared, cheap)
+        # Step 1: Channel mixing
         node_up = self.linear_up(node_features)
 
-        # Step 2: Depthwise tensor product (per-edge, but very cheap)
+        # Step 2: Depthwise tensor product (torch.compiled for ~2x speedup)
         tp_weight = self.radial_mlp(edge_length_embedded)
         messages = self.tp(node_up[edge_src], edge_sh, tp_weight)
 
@@ -342,16 +446,17 @@ class EfficientConvLayer(nn.Module):
         aggregated = scatter(
             messages, edge_dst, dim=0, dim_size=num_nodes, reduce="sum"
         )
-        aggregated = aggregated / (self.num_neighbors ** 0.5)
+        aggregated = aggregated / (self.num_neighbors**0.5)
 
-        # Step 3: Channel mixing (shared, cheap)
+        # Step 3: Channel mixing
         aggregated = self.linear_down(aggregated)
 
         # Self-connection (skip)
         self_feat = self.self_connection(node_features)
 
-        # Gate nonlinearity
-        node_features_out = self.gate(aggregated + self_feat)
+        # S² activation + batch normalization
+        node_features_out = self.s2_act(aggregated + self_feat)
+        node_features_out = self.batch_norm(node_features_out)
 
         return node_features_out
 
@@ -411,8 +516,11 @@ class VMFDirectionHead(nn.Module):
         # Normalize direction to unit vector
         mu = F.normalize(vec_global, dim=-1, eps=1e-8)  # (B, 3)
 
-        # Kappa: softplus to ensure > 0, with learnable bias
-        kappa = F.softplus(scalar_global + self.kappa_bias)  # (B, 1)
+        # Kappa: softplus to ensure > 0
+        # Scale the network output to a reasonable range before adding bias
+        # This prevents kappa explosion at initialization
+        kappa = F.softplus(scalar_global * 0.1 + self.kappa_bias)  # (B, 1)
+        kappa = kappa.clamp(min=0.1, max=500.0)
 
         return mu, kappa
 
@@ -444,10 +552,20 @@ class SupportHead(nn.Module):
         num_scalars = sum(mul for mul, ir in irreps_in if ir.l == 0)
 
         self.mlp = nn.Sequential(
-            nn.Linear(num_scalars, 64),
+            nn.Linear(num_scalars, 256),
             nn.SiLU(),
-            nn.Linear(64, 1),
+            nn.Linear(256, 128),
+            nn.SiLU(),
+            nn.Linear(128, 1),
         )
+
+        # Initialize to prevent logit explosion at start
+        for layer in self.mlp:
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight, gain=0.5)
+                nn.init.zeros_(layer.bias)
+        # Final layer extra small
+        nn.init.xavier_uniform_(self.mlp[-1].weight, gain=0.1)
 
         # Store which components are scalars for extraction
         self._scalar_indices = []
@@ -467,12 +585,12 @@ class SupportHead(nn.Module):
             node_features: (num_nodes, irreps_in.dim) per-node features
 
         Returns:
-            support_prob: (num_nodes,) support probability in [0, 1]
+            support_logits: (num_nodes,) raw logits (apply sigmoid externally if needed)
         """
         # Extract scalar (l=0) features only
         scalars = node_features[:, self._scalar_indices]  # (num_nodes, num_scalars)
         logits = self.mlp(scalars).squeeze(-1)  # (num_nodes,)
-        return torch.sigmoid(logits)
+        return logits
 
 
 # ============================================================
@@ -506,7 +624,7 @@ class EquivariantUprightNet(nn.Module):
 
     def __init__(
         self,
-        irreps_hidden='32x0e+16x1o+8x2e',
+        irreps_hidden="32x0e+16x1o+8x2e",
         lmax=2,
         max_radius=0.5,
         num_layers=4,
@@ -514,7 +632,7 @@ class EquivariantUprightNet(nn.Module):
         radial_neurons=64,
         num_neighbors=20.0,
         kappa_init=10.0,
-        conv_type='depthwise',
+        conv_type="depthwise",
     ):
         super().__init__()
         self.max_radius = max_radius
@@ -532,7 +650,7 @@ class EquivariantUprightNet(nn.Module):
         # --- Equivariant backbone ---
         self.conv_layers = nn.ModuleList()
         for _ in range(num_layers):
-            if conv_type == 'depthwise':
+            if conv_type == "depthwise":
                 layer = EfficientConvLayer(
                     irreps_in=irreps_hidden,
                     irreps_out=irreps_hidden,
@@ -576,17 +694,16 @@ class EquivariantUprightNet(nn.Module):
             dict with:
                 'direction_mu':    (B, 3) predicted upright direction (unit vector)
                 'direction_kappa': (B, 1) vMF concentration (confidence)
-                'support_pred':    (num_nodes,) per-point support probability
+                'support_pred':    (num_nodes,) per-point support logits (raw, before sigmoid)
         """
         pos = data.pos
         batch = data.batch
 
-        # --- Build graph ---
-        edge_index = radius_graph(
+        # --- Build graph (KNN for stable neighbor count) ---
+        edge_index = knn_graph(
             pos,
-            r=self.max_radius,
+            k=int(self.num_neighbors),
             batch=batch,
-            max_num_neighbors=64,
         )
         edge_src, edge_dst = edge_index
 
@@ -603,10 +720,12 @@ class EquivariantUprightNet(nn.Module):
         )  # (E, irreps_sh.dim)
 
         # Radial basis embedding of edge length
+        # Use max observed distance as the upper bound for radial basis
+        max_edge_len = edge_length.max().detach()
         edge_length_embedded = soft_one_hot_linspace(
             edge_length,
             start=0.0,
-            end=self.max_radius,
+            end=max_edge_len + 1e-5,
             number=self.num_radial_basis,
             basis="smooth_finite",
             cutoff=True,
@@ -614,7 +733,7 @@ class EquivariantUprightNet(nn.Module):
         edge_length_embedded = edge_length_embedded.mul(self.num_radial_basis**0.5)
 
         # --- Initial node features ---
-        # Scatter edge SH to destination nodes → per-node initial feature
+        # Scatter edge SH to destination nodes -> per-node initial feature
         node_features = scatter(
             edge_sh,
             edge_dst,
@@ -666,6 +785,6 @@ def build_equivariant_model(opts):
         radial_neurons=opts.radial_neurons,
         num_neighbors=opts.num_neighbors,
         kappa_init=opts.vmf_kappa_init,
-        conv_type=getattr(opts, 'conv_type', 'depthwise'),
+        conv_type=getattr(opts, "conv_type", "depthwise"),
     )
     return model

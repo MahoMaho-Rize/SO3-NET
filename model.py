@@ -277,15 +277,15 @@ class Model:
             train_dataset,
             batch_size=self.opts.batch_size,
             shuffle=True,
-            num_workers=4,
-            pin_memory=True,
+            num_workers=0,
         )
         testDataLoader = PyGDataLoader(
             test_dataset,
-            batch_size=self.opts.batch_size,
+            batch_size=max(
+                self.opts.batch_size * 2, 16
+            ),  # larger bs for eval (no grad)
             shuffle=False,
-            num_workers=4,
-            pin_memory=True,
+            num_workers=0,
         )
         print("The number of training data is: %d" % len(train_dataset))
         print("The number of testing data is: %d" % len(test_dataset))
@@ -305,7 +305,7 @@ class Model:
         torch.manual_seed(self.opts.seed)
 
         # Optimizer
-        optimizer = torch.optim.Adam(
+        optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=self.opts.learning_rate,
             betas=(0.9, 0.999),
@@ -315,10 +315,10 @@ class Model:
         if self.opts.no_decay:
             scheduler = None
         else:
-            scheduler = torch.optim.lr_scheduler.StepLR(
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
-                step_size=20,
-                gamma=self.opts.decay_rate,
+                T_max=self.opts.epoch,
+                eta_min=self.opts.learning_rate * 0.01,
             )
 
         # Loss function
@@ -338,9 +338,8 @@ class Model:
         best_me = float("inf")
 
         for epoch in range(self.opts.epoch):
-            print("Epoch %d / %s:" % (epoch + 1, self.opts.epoch))
-            if scheduler is not None:
-                scheduler.step(epoch)
+            cur_lr = optimizer.param_groups[0]["lr"]
+            print("Epoch %d / %s (lr=%.6f):" % (epoch + 1, self.opts.epoch, cur_lr))
 
             model.train()
             epoch_loss_dir = 0.0
@@ -390,6 +389,7 @@ class Model:
 
             # Evaluate every 5 epochs
             if (epoch + 1) % 5 == 0 or epoch == self.opts.epoch - 1:
+                torch.cuda.empty_cache()
                 me, acc5, acc10 = self._evaluate_equivariant(model, testDataLoader)
                 print(
                     "  [Eval] Mean Error: %.2f deg, Acc@5: %.1f%%, Acc@10: %.1f%%"
@@ -404,6 +404,10 @@ class Model:
                     )
                     torch.save(model.state_dict(), save_path)
                     print("  [Saved] Best model (ME=%.2f) to %s" % (best_me, save_path))
+
+            # Step LR scheduler at end of epoch
+            if scheduler is not None:
+                scheduler.step()
 
         # Save final model
         current_time = datetime.now().strftime("%Y%m%d-%H%M")

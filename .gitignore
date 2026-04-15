@@ -9,3 +9,5 @@ build/
 *.so
 .env
 *.log
+datasets/uprightnet15/*.npy
+models/*.pth
