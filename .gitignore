@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.serena/
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+.env
+*.log

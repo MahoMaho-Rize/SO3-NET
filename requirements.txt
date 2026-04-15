@@ -1,0 +1,8 @@
+torch>=1.12
+e3nn>=0.5.0
+torch-geometric>=2.3
+torch-cluster
+torch-scatter
+numpy
+scikit-learn
+tqdm
