@@ -904,6 +904,7 @@ class DifferentiableLieUprightNet(nn.Module):
         R_iters.append(R_t)
 
         # ---- iterations 2..T: sub-degree refinement ----
+        # Gauge-aware: project delta_omega to tangent plane of current up.
         delta_omegas = []
         support_logits_last = sup_1
         for _ in range(self.num_iters - 1):
@@ -913,6 +914,9 @@ class DifferentiableLieUprightNet(nn.Module):
             polar = self.polarity(P_t, sup)
             fused = torch.cat([feat, polar], dim=-1)
             delta_w = self.head.refine_update(fused)
+            up_t = R_t[:, :, 1]
+            proj_coef = (delta_w * up_t).sum(dim=-1, keepdim=True)
+            delta_w = delta_w - proj_coef * up_t
             delta_omegas.append(delta_w)
             R_t = torch.bmm(R_t, exp_so3(delta_w))
             R_iters.append(R_t)
@@ -1057,6 +1061,14 @@ class DifferentiableLieUprightRefineNet(nn.Module):
         R_iters = [R_t]
 
         # ---- iterations 1..T: continuous coarse-to-fine refinement ----
+        # Gauge-aware so(3) update: the task-level GT is an axis in S²
+        # (only R[:, :, 1] matters); rotations about that axis are a gauge
+        # freedom with zero loss gradient. We therefore project delta_omega
+        # onto the plane orthogonal to the current up axis, so the refine
+        # head cannot waste capacity on unobservable rotations.
+        #   delta_w_tangent = delta_w - (delta_w · u) · u
+        # This keeps the update strictly on S² (which is what we want to
+        # refine); the head effectively outputs a tangent vector in T_u S².
         delta_omegas = []
         support_logits_last = sup_logits_0
         for t in range(self.num_iters):
@@ -1066,6 +1078,10 @@ class DifferentiableLieUprightRefineNet(nn.Module):
             polar = self.polarity(P_t, sup)
             fused = torch.cat([feat, polar], dim=-1)
             delta_w = self.refine_head(fused, max_angle=self.max_angle_schedule[t])
+            # Project onto plane orthogonal to current up axis (R_t[:, :, 1])
+            up_t = R_t[:, :, 1]  # (B, 3)
+            proj_coef = (delta_w * up_t).sum(dim=-1, keepdim=True)  # (B, 1)
+            delta_w = delta_w - proj_coef * up_t  # (B, 3), orthogonal to up_t
             delta_omegas.append(delta_w)
             R_t = torch.bmm(R_t, exp_so3(delta_w))
             R_iters.append(R_t)
