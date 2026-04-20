@@ -1,0 +1,32 @@
+# Top-30 worst predictions by official Upright-Net
+# idx, label, err_deg, num_support
+  31396  lab= 8 (      lamp)  err= 179.97°  n_sup= 446
+  31399  lab= 8 (      lamp)  err= 179.97°  n_sup= 451
+  31398  lab= 8 (      lamp)  err= 179.97°  n_sup= 448
+  31397  lab= 8 (      lamp)  err= 179.97°  n_sup= 452
+  31369  lab= 8 (      lamp)  err= 179.97°  n_sup= 452
+  31370  lab= 8 (      lamp)  err= 179.97°  n_sup= 454
+  31376  lab= 8 (      lamp)  err= 179.97°  n_sup= 456
+   2874  lab= 2 (    bottle)  err= 179.97°  n_sup= 183
+  31364  lab= 8 (      lamp)  err= 179.97°  n_sup= 446
+  31365  lab= 8 (      lamp)  err= 179.97°  n_sup= 450
+  31367  lab= 8 (      lamp)  err= 179.97°  n_sup= 458
+  31368  lab= 8 (      lamp)  err= 179.97°  n_sup= 453
+  31372  lab= 8 (      lamp)  err= 179.97°  n_sup= 454
+  31373  lab= 8 (      lamp)  err= 179.97°  n_sup= 439
+  31300  lab= 8 (      lamp)  err= 179.97°  n_sup= 453
+  31335  lab= 8 (      lamp)  err= 179.97°  n_sup= 427
+  31332  lab= 8 (      lamp)  err= 179.97°  n_sup= 457
+  31360  lab= 8 (      lamp)  err= 179.97°  n_sup= 459
+  31358  lab= 8 (      lamp)  err= 179.97°  n_sup= 455
+  31382  lab= 8 (      lamp)  err= 179.97°  n_sup= 447
+  31381  lab= 8 (      lamp)  err= 179.97°  n_sup= 452
+  31386  lab= 8 (      lamp)  err= 179.97°  n_sup= 458
+  31391  lab= 8 (      lamp)  err= 179.97°  n_sup= 432
+  31389  lab= 8 (      lamp)  err= 179.97°  n_sup= 448
+  31392  lab= 8 (      lamp)  err= 179.97°  n_sup= 461
+  31395  lab= 8 (      lamp)  err= 179.97°  n_sup= 437
+  31384  lab= 8 (      lamp)  err= 179.97°  n_sup= 443
+  31385  lab= 8 (      lamp)  err= 179.97°  n_sup= 445
+  31388  lab= 8 (      lamp)  err= 179.97°  n_sup= 439
+  31378  lab= 8 (      lamp)  err= 179.97°  n_sup= 450
