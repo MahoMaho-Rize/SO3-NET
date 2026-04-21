@@ -520,16 +520,20 @@ class FlipRefineHead(nn.Module):
 
 class ContinuousRefineHead(nn.Module):
     """MLP that maps a fused (scalar + polarity) feature to an so(3) tangent
-    update, with a tunable per-call `max_angle` cap via soft clipping.
+    update. The magnitude is soft-clipped at π - ε (the well-posed range of
+    the Rodrigues exp map).
 
-    Inputs are the concatenation of trunk global feature + polarity feature.
-    The MLP is a single 3-layer SiLU stack, reused across all iterations;
-    only the `max_angle` passed at forward changes per iteration (coarse-to-
-    fine schedule), which is how RAFT/DROID-SLAM/BA-Net commonly do it.
+    Unlike the older per-iter `max_angle_schedule` design, this head makes
+    no distinction between iterations: the same MLP is called T times,
+    and the head is free to output large omega early (when the canonical
+    frame is still far off) and small omega late (when it's nearly right).
+    The coarse-to-fine behaviour emerges from the data rather than being
+    hard-coded.
     """
 
-    def __init__(self, in_dim: int, hidden: int = 256):
+    def __init__(self, in_dim: int, hidden: int = 256, clip_angle: float = math.pi - 0.05):
         super().__init__()
+        self.clip_angle = clip_angle
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.SiLU(),
@@ -537,23 +541,23 @@ class ContinuousRefineHead(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden, 3),
         )
-        # Small init so that the untrained network barely perturbs R_0
-        # (which is the coarse-estimator output). This keeps zero-shot
-        # behaviour essentially equal to the coarse baseline.
-        nn.init.xavier_uniform_(self.mlp[-1].weight, gain=0.01)
+        # Head init needs to be large enough that different samples produce
+        # distinguishable outputs at step 0 — otherwise the per-sample
+        # gradients all point in essentially the same tiny direction and
+        # cancel out across the batch, leaving the head stuck at ~0.
+        nn.init.xavier_uniform_(self.mlp[-1].weight, gain=0.5)
         nn.init.zeros_(self.mlp[-1].bias)
 
-    def forward(self, feat: torch.Tensor, max_angle: float) -> torch.Tensor:
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
         """
         Args:
             feat: (B, in_dim)
-            max_angle: float, soft upper bound on ||omega|| (radians)
         Returns:
-            omega: (B, 3), ||omega|| <= max_angle (soft clip via tanh)
+            omega: (B, 3), ||omega|| <= clip_angle (soft clip via tanh)
         """
         omega = self.mlp(feat)
         mag = omega.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        scaled = torch.tanh(mag / max_angle) * max_angle
+        scaled = torch.tanh(mag / self.clip_angle) * self.clip_angle
         return omega * (scaled / mag)
 
 
@@ -914,9 +918,9 @@ class DifferentiableLieUprightNet(nn.Module):
             polar = self.polarity(P_t, sup)
             fused = torch.cat([feat, polar], dim=-1)
             delta_w = self.head.refine_update(fused)
-            up_t = R_t[:, :, 1]
-            proj_coef = (delta_w * up_t).sum(dim=-1, keepdim=True)
-            delta_w = delta_w - proj_coef * up_t
+            # Gauge projection in LOCAL frame: kill the y-component (rotations
+            # about the local up axis don't change R_t @ e_y).
+            delta_w = delta_w * delta_w.new_tensor([1.0, 0.0, 1.0])
             delta_omegas.append(delta_w)
             R_t = torch.bmm(R_t, exp_so3(delta_w))
             R_iters.append(R_t)
@@ -968,15 +972,19 @@ class DifferentiableLieUprightRefineNet(nn.Module):
         R_0 = so3_from_up(weighted_plane_normal(P, trunk_support(P)),
                           pca_largest_axis(P))                 # coarse init
 
-        angles = self.max_angle_schedule   # per-iter soft clip, e.g. [π, π/4, π/18]
         for t in range(T):
             P_t = R_t^T @ P
             feat, sup = trunk(P_t)
             polar = PolarityFeatures(P_t, sup)
-            delta_w = refine_head(cat(feat, polar), angles[t])
+            delta_w = refine_head(cat(feat, polar))  # no per-iter schedule
             R_{t+1} = R_t @ exp_so3(delta_w)
 
         up = R_T @ e_y
+
+    The refine head is iteration-agnostic: it outputs an so(3) step whose
+    magnitude it controls itself via a tanh clip at π - ε. Coarse-to-fine
+    behaviour is learned from data (big step when P_t is still far off the
+    canonical frame, small step when it's close).
 
     Equivariance:
         Iteration 0 is trunk(P) + SVD + so3_from_up(up, pca_axis(P)). The
@@ -988,8 +996,6 @@ class DifferentiableLieUprightRefineNet(nn.Module):
 
     Args:
         num_iters:          T, number of refinement iterations (default 3)
-        max_angle_schedule: list of length T, per-iter soft clip angles.
-            Default [π, π/4, π/18] ≈ [180°, 45°, 10°] — coarse-to-fine.
         feature_dim:        trunk global output dim (1024)
         head_hidden:        refine MLP hidden size
     """
@@ -997,7 +1003,6 @@ class DifferentiableLieUprightRefineNet(nn.Module):
     def __init__(
         self,
         num_iters: int = 3,
-        max_angle_schedule=None,
         feature_dim: int = 1024,
         head_hidden: int = 256,
         eps_cov: float = 1e-5,
@@ -1005,17 +1010,7 @@ class DifferentiableLieUprightRefineNet(nn.Module):
         super().__init__()
         if num_iters < 1:
             raise ValueError("num_iters must be >= 1")
-        if max_angle_schedule is None:
-            # Default coarse-to-fine: 180° -> 45° -> 10°
-            max_angle_schedule = [math.pi, math.pi / 4, math.pi / 18]
-        if len(max_angle_schedule) < num_iters:
-            # Extend with the finest angle if schedule is shorter
-            last = max_angle_schedule[-1]
-            max_angle_schedule = list(max_angle_schedule) + [last] * (
-                num_iters - len(max_angle_schedule)
-            )
         self.num_iters = num_iters
-        self.max_angle_schedule = list(max_angle_schedule[:num_iters])
         self.eps_cov = eps_cov
 
         self.trunk = UprightNetTrunk()
@@ -1077,11 +1072,12 @@ class DifferentiableLieUprightRefineNet(nn.Module):
             support_logits_last = sup
             polar = self.polarity(P_t, sup)
             fused = torch.cat([feat, polar], dim=-1)
-            delta_w = self.refine_head(fused, max_angle=self.max_angle_schedule[t])
-            # Project onto plane orthogonal to current up axis (R_t[:, :, 1])
-            up_t = R_t[:, :, 1]  # (B, 3)
-            proj_coef = (delta_w * up_t).sum(dim=-1, keepdim=True)  # (B, 1)
-            delta_w = delta_w - proj_coef * up_t  # (B, 3), orthogonal to up_t
+            delta_w = self.refine_head(fused)
+            # Gauge projection: delta_w is in the LOCAL frame (update is applied
+            # as R_t @ exp(delta_w)), so the direction that leaves up invariant
+            # is local e_y = (0, 1, 0) — rotations about the local y-axis are
+            # the gauge freedom. Zero out the y-component.
+            delta_w = delta_w * delta_w.new_tensor([1.0, 0.0, 1.0])
             delta_omegas.append(delta_w)
             R_t = torch.bmm(R_t, exp_so3(delta_w))
             R_iters.append(R_t)

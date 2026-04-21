@@ -28,7 +28,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from tqdm import tqdm
 
 REPO = Path(__file__).resolve().parents[1]
@@ -86,14 +86,25 @@ def geodesic_from_rotation_up_column(R, gt_up, eps=1e-7):
 
 
 def compute_multi_iter_loss(R_iters, gt_up, gamma=0.8):
-    """Compute Σ γ^(T-t) · geodesic(R_t, gt_up). R_iters has len T+1."""
+    """Compute Σ_{t=1..T} γ^(T-t) · geodesic(R_t, gt_up). R_iters has len T+1.
+
+    The t=0 term (coarse init R_0) is EXCLUDED from the loss because R_0 is
+    produced by the frozen trunk + SVD and carries zero gradient to the
+    refine head. Including it only adds a constant ~26% dilution to the
+    reported loss without contributing to learning. It's still computed
+    and returned in per_iter[0] for diagnostics.
+    """
     T = len(R_iters) - 1  # num_iters
     total = 0.0
     per_iter = []
-    # Weights: coarse init (t=0) has weight γ^T; final (t=T) has weight 1.
-    for t, R in enumerate(R_iters):
+    # t=0: diagnostic only (no gradient to head when trunk is frozen)
+    with torch.no_grad():
+        l0 = geodesic_from_rotation_up_column(R_iters[0], gt_up).mean()
+    per_iter.append(l0.item())
+    # t=1..T: loss with weights γ^(T-t)
+    for t in range(1, T + 1):
         w = gamma ** (T - t)
-        l = geodesic_from_rotation_up_column(R, gt_up).mean()
+        l = geodesic_from_rotation_up_column(R_iters[t], gt_up).mean()
         total = total + w * l
         per_iter.append(l.item())
     return total, per_iter
@@ -156,6 +167,70 @@ def per_category(err, labels):
 
 
 # --------------------------------------------------------------------------
+# BN handling for fine-tuning a pretrained trunk
+# --------------------------------------------------------------------------
+
+
+_BN_TYPES = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)
+
+
+def freeze_bn(module):
+    """Keep all BN layers in eval mode and freeze γ, β.
+
+    This is the standard fine-tune recipe for pretrained backbones:
+      - running_mean / running_var stay at the pretrained values
+      - γ, β are not updated by the optimiser
+      - train() calls on the parent won't flip BN back to train mode
+    """
+    for m in module.modules():
+        if isinstance(m, _BN_TYPES):
+            m.eval()
+            if m.weight is not None:
+                m.weight.requires_grad = False
+            if m.bias is not None:
+                m.bias.requires_grad = False
+
+
+def set_bn_eval(module):
+    """Force every BN submodule to eval() (for use inside an epoch when the
+    parent was just switched to train() mode)."""
+    for m in module.modules():
+        if isinstance(m, _BN_TYPES):
+            m.eval()
+
+
+@torch.no_grad()
+def recalibrate_bn(model, loader, device):
+    """Re-estimate BN running stats by a no-grad forward pass over `loader`.
+
+    Uses `momentum=None` so the running mean/var converge to the simple
+    arithmetic average over all batches (not an exponential moving average).
+    Only the trunk's BN layers are reset & updated; head/polarity have none.
+    """
+    print("[BN recalibration] resetting trunk BN running stats...")
+    saved_momentum = {}
+    for name, m in model.named_modules():
+        if isinstance(m, _BN_TYPES):
+            saved_momentum[name] = m.momentum
+            m.momentum = None
+            m.reset_running_stats()
+            m.train()  # enable running-stats accumulation
+    # The rest of the model stays in eval (we only want BN to update).
+    # No grad anyway; just stream batches through.
+    n_batches = 0
+    for P, _gt_up, _lab in tqdm(loader, desc="BN recalibration"):
+        P = P.to(device, non_blocking=True)
+        model(P)
+        n_batches += 1
+    # Restore momentum & put BN back in eval
+    for name, m in model.named_modules():
+        if isinstance(m, _BN_TYPES):
+            m.momentum = saved_momentum[name]
+            m.eval()
+    print(f"[BN recalibration] done ({n_batches} batches)")
+
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 
@@ -170,8 +245,6 @@ def main():
     ap.add_argument("--eval_batch_size", type=int, default=32)
     ap.add_argument("--num_points", type=int, default=2048)
     ap.add_argument("--num_iters", type=int, default=3)
-    ap.add_argument("--max_angle_schedule", type=float, nargs="+",
-                    default=[math.pi, math.pi / 4, math.pi / 18])
     ap.add_argument("--gamma", type=float, default=0.8,
                     help="loss weighting: Σ γ^(T-t) · geo(R_t, gt)")
     ap.add_argument("--lr_head", type=float, default=1e-3)
@@ -185,18 +258,52 @@ def main():
     ap.add_argument("--save_name", default="dlie_refine")
     ap.add_argument("--eval_at_start", action="store_true",
                     help="evaluate the untrained model first (baseline)")
+    ap.add_argument("--max_train_samples", type=int, default=0,
+                    help="if >0, use a class-stratified subset of train for fast sanity runs")
+    ap.add_argument("--max_test_samples", type=int, default=0,
+                    help="if >0, use a class-stratified subset of test")
+    ap.add_argument("--freeze_bn", action="store_true",
+                    help="keep trunk BN in eval mode (running stats + γ/β frozen) "
+                         "during training — standard fine-tune practice when "
+                         "starting from a pretrained backbone")
+    ap.add_argument("--recalibrate_bn", action="store_true",
+                    help="after training, re-estimate trunk BN running stats "
+                         "by a no-grad forward pass over the training set. "
+                         "Typically used together with --freeze_bn.")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
     device = torch.device("cuda")
-    print(f"Schedule: {[f'{math.degrees(a):.0f}°' for a in args.max_angle_schedule]}")
+    print(f"num_iters={args.num_iters} (continuous head, no per-iter schedule)")
     print(f"Gamma={args.gamma}  lr_head={args.lr_head}  lr_trunk={args.lr_trunk}")
 
     # ---- Data ----
     train_ds = UprightNet15RotatedDataset(args.data_dir, "train", args.num_points)
     test_ds = UprightNet15RotatedDataset(args.data_dir, "test", args.num_points)
+
+    def _stratified_subset(ds, max_samples, seed):
+        """Class-stratified subset: take roughly equal samples per label."""
+        labels = np.asarray(ds.labels)
+        rng = np.random.default_rng(seed)
+        classes = np.unique(labels)
+        per_class = max(1, max_samples // len(classes))
+        idx = []
+        for c in classes:
+            c_idx = np.where(labels == c)[0]
+            take = min(per_class, len(c_idx))
+            idx.extend(rng.choice(c_idx, size=take, replace=False).tolist())
+        rng.shuffle(idx)
+        return Subset(ds, idx[:max_samples])
+
+    if args.max_train_samples > 0:
+        train_ds = _stratified_subset(train_ds, args.max_train_samples, args.seed)
+        print(f"[sanity] train subset: {len(train_ds)} samples (class-stratified)")
+    if args.max_test_samples > 0:
+        test_ds = _stratified_subset(test_ds, args.max_test_samples, args.seed + 1)
+        print(f"[sanity] test subset: {len(test_ds)} samples (class-stratified)")
+
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=True, drop_last=True,
@@ -211,7 +318,6 @@ def main():
     # ---- Model ----
     model = DifferentiableLieUprightRefineNet(
         num_iters=args.num_iters,
-        max_angle_schedule=args.max_angle_schedule,
     ).to(device)
     model.load_backbone_from_ckpt(args.ref_ckpt)
     print(f"Loaded reference trunk from {args.ref_ckpt}")
@@ -219,17 +325,26 @@ def main():
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Params total={n_params:,} trainable={n_trainable:,}")
 
+    # ---- BN handling ----
+    # If freeze_bn is set (typical fine-tune recipe), BN running stats and γ/β
+    # stay at their pretrained values throughout training. Either way, BN
+    # should always be in eval mode whenever the trunk itself is frozen.
+    trunk_frozen = args.lr_trunk <= 0
+    if args.freeze_bn or trunk_frozen:
+        freeze_bn(model.trunk)
+        print("BN layers in trunk frozen (eval mode, γ/β requires_grad=False)")
+
     # ---- Optimiser: separate LR for trunk vs head ----
-    trunk_params = list(model.trunk.parameters())
+    trunk_params = [p for p in model.trunk.parameters() if p.requires_grad]
     head_params = list(model.refine_head.parameters())
     param_groups = []
     if args.lr_trunk > 0:
         param_groups.append({"params": trunk_params, "lr": args.lr_trunk,
                              "name": "trunk"})
     else:
-        for p in trunk_params:
+        for p in model.trunk.parameters():
             p.requires_grad = False
-        print("Trunk frozen (lr_trunk=0)")
+        print("Trunk frozen (lr_trunk=0) — BN running stats will be kept fixed")
     param_groups.append({"params": head_params, "lr": args.lr_head,
                          "name": "head"})
     optim = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay,
@@ -258,6 +373,13 @@ def main():
         print()
         print(f"=== Epoch {epoch}/{args.epochs} ===")
         model.train()
+        if trunk_frozen:
+            # Whole trunk in eval mode (also freezes BN running stats).
+            model.trunk.eval()
+        elif args.freeze_bn:
+            # Trunk convs train, but BN stays in eval (running stats + γ/β
+            # frozen per the standard pretrained fine-tune recipe).
+            set_bn_eval(model.trunk)
         t_start = time.time()
         running_total = 0.0
         running_per_iter = None
@@ -338,6 +460,36 @@ def main():
             "test_acc10_init": a10_init, "test_acc10_final": a10_final,
             "test_flip_init": flip_init, "test_flip_final": flip_final,
         })
+
+    # ---- Optional BN recalibration (Phase 2 of the fine-tune recipe) ----
+    # After fine-tuning with frozen BN, the trunk's convs output a slightly
+    # different distribution than what Pang's BN stats expected. A no-grad
+    # sweep over the training set re-estimates running_mean / running_var so
+    # eval time matches the new distribution.
+    if args.recalibrate_bn:
+        print()
+        print("=== Post-training BN recalibration ===")
+        model.eval()
+        recalibrate_bn(model, train_loader, device)
+        print("Evaluating after recalibration...")
+        errs, errs_init, labels_np = evaluate(model, test_loader, device)
+        m_init, a10_init, flip_init = summarise("init ", errs_init)
+        m_final, a10_final, flip_final = summarise("final", errs)
+        print(per_category(errs, labels_np))
+        if a10_final > best_acc10:
+            best_acc10 = a10_final
+            best_mean = m_final
+            ck = ckpt_dir / f"{args.save_name}_best.pth"
+            torch.save({
+                "epoch": "recalibrated",
+                "model": model.state_dict(),
+                "optim": optim.state_dict(),
+                "acc10": a10_final,
+                "mean": m_final,
+                "flip": flip_final,
+                "args": vars(args),
+            }, ck)
+            print(f"  [Saved] {ck}  (acc@10={a10_final:.2f}% mean={m_final:.2f}°)")
 
     # ---- Final save ----
     ck_final = ckpt_dir / f"{args.save_name}_final.pth"

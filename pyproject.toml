@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uprightnet"
+version = "0.2.0"
+description = "Differentiable Lie-algebra iterative upright orientation estimation for 3D point clouds"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Yujian Shi" }]
+keywords = [
+    "point-cloud",
+    "upright-orientation",
+    "equivariance",
+    "SO3",
+    "lie-algebra",
+    "deep-learning",
+]
+
+dependencies = [
+    "torch>=1.12",
+    "numpy",
+    "tqdm",
+    "scipy",
+    "scikit-learn",
+]
+
+[project.optional-dependencies]
+# Equivariant baselines (network_equivariant.py)
+equivariant = [
+    "e3nn>=0.5.0",
+    "torch-geometric>=2.3",
+    "torch-cluster",
+    "torch-scatter",
+]
+
+dev = [
+    "ruff>=0.4",
+    "pytest>=7",
+]
+
+# Helper for converting design docs (scripts/md_to_pdf.py)
+docs = [
+    "markdown",
+    "weasyprint",
+]
+
+[tool.setuptools]
+py-modules = ["network", "network_lie", "network_equivariant", "model", "config"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["Common*", "scripts*"]
+exclude = ["datasets*", "models*", "logs*", "docs*", "__pycache__*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "B"]
+ignore = [
+    "E501",  # line length handled by formatter
+    "N803",  # argument name — math notation (P, R, N) is clearer than snake_case
+    "N806",  # same reason for locals
+]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*" = ["E402"]  # sys.path mutation before imports
