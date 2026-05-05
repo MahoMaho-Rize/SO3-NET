@@ -8,6 +8,7 @@ build/
 .eggs/
 *.so
 .env
+.venv
 *.log
 datasets/uprightnet15/*.npy
 models/*.pth
