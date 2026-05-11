@@ -97,6 +97,54 @@ class SignedDirectionHead(nn.Module):
         return F.normalize(raw, dim=-1)
 
 
+class DecomposedDirectionHead(nn.Module):
+    """Predicts unsigned axis + polarity sign separately.
+
+    Rationale: the axis is a local-geometric quantity (lines through origin),
+    while the sign is a global-semantic property (which end points "up").
+    Splitting them into separate heads lets each branch receive a gradient
+    tailored to its sub-task:
+
+    - axis_head: trained with antipodal geodesic loss (|cos|).
+    - sign_head: trained with BCE; gradient is strongest near the decision
+      boundary, which is exactly the flip-prone regime.
+
+    Input: concatenation of trunk global feat + context feat.
+    Outputs:
+        axis:       (B, 3) unit vector (unsigned)
+        sign_logit: (B,)   raw logit; sigmoid(.) in (0,1) is P(keep axis)
+    """
+
+    def __init__(self, in_dim, hidden=512):
+        super().__init__()
+        self.shared = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.GELU(),
+            nn.LayerNorm(hidden),
+        )
+        self.axis_head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, 3),
+        )
+        self.sign_head = nn.Sequential(
+            nn.Linear(hidden, hidden // 2),
+            nn.GELU(),
+            nn.Linear(hidden // 2, 1),
+        )
+        nn.init.xavier_uniform_(self.axis_head[-1].weight, gain=0.1)
+        nn.init.zeros_(self.axis_head[-1].bias)
+        nn.init.xavier_uniform_(self.sign_head[-1].weight, gain=0.1)
+        nn.init.zeros_(self.sign_head[-1].bias)
+
+    def forward(self, feat):
+        h = self.shared(feat)
+        axis = F.normalize(self.axis_head(h), dim=-1)
+        sign_logit = self.sign_head(h).squeeze(-1)
+        return axis, sign_logit
+
+
 class SHSUprightNet(nn.Module):
     """SHS-style signed direction network for upright estimation.
 
@@ -109,6 +157,8 @@ class SHSUprightNet(nn.Module):
         context_heads:  number of attention heads
         head_hidden:    hidden dim of the signed direction MLP head
         freeze_trunk:   if True, freeze the DGCNN trunk (use pretrained weights)
+        head_type:      'signed' (single head, original SHS baseline) or
+                        'decomposed' (separate axis + sign heads)
     """
 
     def __init__(
@@ -117,8 +167,12 @@ class SHSUprightNet(nn.Module):
         context_heads=4,
         head_hidden=512,
         freeze_trunk=True,
+        head_type="decomposed",
     ):
         super().__init__()
+        if head_type not in ("signed", "decomposed"):
+            raise ValueError(f"head_type must be 'signed' or 'decomposed', got {head_type}")
+        self.head_type = head_type
         self.trunk = UprightNet()
         self.freeze_trunk = freeze_trunk
 
@@ -130,11 +184,15 @@ class SHSUprightNet(nn.Module):
             ff_dim=256,
         )
 
-        # trunk global_feat (1024) + context (128) = 1152
-        self.direction_head = SignedDirectionHead(
-            in_dim=1024 + self.context.out_dim,
-            hidden=head_hidden,
-        )
+        fused_dim = 1024 + self.context.out_dim  # = 1152
+        if head_type == "signed":
+            self.direction_head = SignedDirectionHead(
+                in_dim=fused_dim, hidden=head_hidden,
+            )
+        else:
+            self.direction_head = DecomposedDirectionHead(
+                in_dim=fused_dim, hidden=head_hidden,
+            )
 
         # Auxiliary support head (reuses trunk's support prediction)
         # No extra parameters — we just expose the trunk's sigmoid output.
@@ -158,6 +216,8 @@ class SHSUprightNet(nn.Module):
             dict with:
                 up:             (B, 3) signed upright direction (unit vector)
                 support_logits: (B, N) per-point support probability from trunk
+                axis:           (B, 3) unsigned axis, decomposed head only
+                sign_logit:     (B,)   polarity logit, decomposed head only
         """
         x = points_bnc.transpose(1, 2).contiguous()  # (B, 3, N)
         batch_size = x.size(0)
@@ -197,11 +257,28 @@ class SHSUprightNet(nn.Module):
         # x_b = cat(x1,x2,x3,x4) captures multi-scale attention output.
         context_feat = self.context(x_b)  # (B, 128)
 
-        # ---- Signed direction head ----
+        # ---- Direction head ----
         fused = torch.cat([global_feat, context_feat], dim=-1)  # (B, 1152)
-        up = self.direction_head(fused)  # (B, 3)
+
+        if self.head_type == "signed":
+            up = self.direction_head(fused)
+            return {
+                "up": up,
+                "support_logits": support_logits,
+            }
+
+        axis, sign_logit = self.direction_head(fused)
+        # Straight-through estimator: forward uses hard sign, gradient flows via
+        # the soft (2p - 1) path so the sign head is trainable end-to-end.
+        p = torch.sigmoid(sign_logit)
+        soft = 2.0 * p - 1.0
+        hard = torch.where(soft >= 0, torch.ones_like(soft), -torch.ones_like(soft))
+        ste_sign = hard + soft - soft.detach()  # (B,)
+        up = axis * ste_sign.unsqueeze(-1)  # (B, 3)
 
         return {
             "up": up,
+            "axis": axis,
+            "sign_logit": sign_logit,
             "support_logits": support_logits,
         }

@@ -29,7 +29,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from network_shs import SHSUprightNet
-from Common.loss_shs import SHSLoss
+from Common.loss_shs import SHSLoss, DecomposedLoss
 from Common.geometric_utils import angular_error_deg
 
 
@@ -194,6 +194,18 @@ def main():
     parser.add_argument("--context_heads", type=int, default=4)
     parser.add_argument("--head_hidden", type=int, default=512)
     parser.add_argument("--freeze_trunk", action="store_true")
+    parser.add_argument("--head_type", choices=["signed", "decomposed"],
+                        default="decomposed",
+                        help="'decomposed' = axis + sign branches (main line); "
+                             "'signed' = legacy single-head baseline")
+
+    # Loss
+    parser.add_argument("--loss", choices=["decomposed", "signed"],
+                        default="decomposed")
+    parser.add_argument("--lambda_axis", type=float, default=1.0)
+    parser.add_argument("--lambda_sign", type=float, default=0.5)
+    parser.add_argument("--lambda_sup", type=float, default=0.1)
+    parser.add_argument("--lambda_stab", type=float, default=0.2)
 
     # Training
     parser.add_argument("--epochs", type=int, default=30)
@@ -203,7 +215,7 @@ def main():
                         help="Separate LR for trunk (0 = frozen)")
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--beta", type=float, default=0.1,
-                        help="Auxiliary support loss weight")
+                        help="Auxiliary support loss weight (signed-loss mode only)")
     parser.add_argument("--grad_clip", type=float, default=5.0)
     parser.add_argument("--num_points", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=42)
@@ -236,12 +248,20 @@ def main():
     )
     print(f"Train: {len(train_ds)} objects, Test: {len(test_ds)} objects")
 
+    # Guard: decomposed loss needs decomposed head
+    if args.loss == "decomposed" and args.head_type != "decomposed":
+        raise ValueError(
+            f"--loss decomposed requires --head_type decomposed "
+            f"(got head_type={args.head_type})"
+        )
+
     # ---- Model ----
     model = SHSUprightNet(
         context_layers=args.context_layers,
         context_heads=args.context_heads,
         head_hidden=args.head_hidden,
         freeze_trunk=args.freeze_trunk or args.lr_trunk == 0,
+        head_type=args.head_type,
     ).to(device)
 
     # Load trunk
@@ -289,7 +309,18 @@ def main():
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
     )
 
-    criterion = SHSLoss(beta=args.beta)
+    if args.loss == "decomposed":
+        criterion = DecomposedLoss(
+            lambda_axis=args.lambda_axis,
+            lambda_sign=args.lambda_sign,
+            lambda_sup=args.lambda_sup,
+            lambda_stab=args.lambda_stab,
+        )
+        print(f"Loss: Decomposed (λ_axis={args.lambda_axis}, λ_sign={args.lambda_sign}, "
+              f"λ_sup={args.lambda_sup}, λ_stab={args.lambda_stab})")
+    else:
+        criterion = SHSLoss(beta=args.beta)
+        print(f"Loss: SHS signed-geodesic (β={args.beta})")
 
     # ---- Initial eval ----
     print("\n--- Zero-shot evaluation (before training) ---")
@@ -306,9 +337,7 @@ def main():
         if args.freeze_trunk or args.lr_trunk == 0:
             model.trunk.eval()  # keep BN in eval mode
 
-        epoch_loss_dir = 0.0
-        epoch_loss_sup = 0.0
-        epoch_loss_total = 0.0
+        epoch_sums = {}
         num_batches = 0
 
         pbar = tqdm(train_dl, desc=f"Epoch {epoch}/{args.epochs}")
@@ -318,7 +347,11 @@ def main():
             support = support.to(device)
 
             out = model(pos)
-            targets = {"y_direction": y_dir, "y_support": support}
+            targets = {
+                "y_direction": y_dir,
+                "y_support": support,
+                "points": pos,
+            }
             loss_dict = criterion(out, targets)
             loss = loss_dict["total"]
 
@@ -328,23 +361,24 @@ def main():
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
 
-            epoch_loss_total += loss_dict["total"].item()
-            epoch_loss_dir += loss_dict["direction"].item()
-            epoch_loss_sup += loss_dict["support"].item()
+            for k, v in loss_dict.items():
+                epoch_sums[k] = epoch_sums.get(k, 0.0) + v.item()
             num_batches += 1
 
-            pbar.set_postfix(
-                loss=f"{loss_dict['total'].item():.4f}",
-                dir=f"{loss_dict['direction'].item():.4f}",
-            )
+            postfix = {"loss": f"{loss_dict['total'].item():.4f}"}
+            if "axis" in loss_dict:
+                postfix["axis"] = f"{loss_dict['axis'].item():.3f}"
+                postfix["sign"] = f"{loss_dict['sign'].item():.3f}"
+            else:
+                postfix["dir"] = f"{loss_dict['direction'].item():.3f}"
+            pbar.set_postfix(**postfix)
 
         scheduler.step()
 
-        avg_total = epoch_loss_total / num_batches
-        avg_dir = epoch_loss_dir / num_batches
-        avg_sup = epoch_loss_sup / num_batches
+        avgs = {k: v / num_batches for k, v in epoch_sums.items()}
         cur_lr = optimizer.param_groups[-1]["lr"]
-        print(f"  Loss: {avg_total:.4f} (dir: {avg_dir:.4f}, sup: {avg_sup:.4f}), lr: {cur_lr:.6f}")
+        comp_str = ", ".join(f"{k}: {v:.4f}" for k, v in avgs.items() if k != "total")
+        print(f"  Loss: {avgs['total']:.4f} ({comp_str}), lr: {cur_lr:.6f}")
 
         # ---- Evaluate ----
         if epoch % args.eval_every == 0 or epoch == args.epochs or epoch == 1:
