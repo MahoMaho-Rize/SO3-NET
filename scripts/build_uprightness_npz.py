@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=0, help="0 means all matched files")
     p.add_argument("--seed", type=int, default=2026)
     p.add_argument(
+        "--compress",
+        action="store_true",
+        help="Use np.savez_compressed. Smaller but much slower on large datasets.",
+    )
+    p.add_argument(
         "--source-up-axis",
         choices=("y", "z"),
         default="z",
@@ -134,6 +139,7 @@ def write_npz(
     num_points: int,
     seed: int,
     source_up_axis: str,
+    compress: bool,
 ) -> None:
     rng = np.random.default_rng(seed)
     points = np.empty((len(rows), num_points, 3), dtype=np.float32)
@@ -160,7 +166,13 @@ def write_npz(
             view_index[i] = -1
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
+    save_fn = np.savez_compressed if compress else np.savez
+    print(
+        f"[save] {out_path} mode={'compressed' if compress else 'uncompressed'} "
+        f"clouds={len(rows)} points={num_points}",
+        flush=True,
+    )
+    save_fn(
         out_path,
         points=points,
         category_id=category_id,
@@ -203,6 +215,7 @@ def main() -> None:
             args.num_points,
             args.seed + (0 if split == "train" else 1),
             args.source_up_axis,
+            args.compress,
         )
 
 
