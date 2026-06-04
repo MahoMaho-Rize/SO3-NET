@@ -13,8 +13,27 @@ build/
 datasets/uprightnet15/*.npy
 models/*.pth
 
+# Downloaded / generated datasets
+datasets/downloads/
+datasets/ModelNet40/
+datasets/uprightnet15/
+datasets/uprightnet15_partial_camera/
+datasets/uprightnet15_partial_mesh/
+datasets/uprightnet15_partial_points/
+datasets/uprightness_partial_npz/
+
+# Local Blender source/build tree used for data generation experiments
+blender-pixi/
+
+# Training outputs
+models/
+
 # Experiment artefacts — keep text diagnostics, ignore binary / regeneratable
+logs/*.csv
 logs/*.npz
 logs/*.png
 logs/*.pth
 logs/*.pt
+# pixi environments
+.pixi/*
+!.pixi/config.toml
