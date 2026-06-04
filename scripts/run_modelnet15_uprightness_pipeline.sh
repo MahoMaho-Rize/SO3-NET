@@ -29,6 +29,7 @@ Common overrides:
   BATCH_SIZE=128
   SAMPLES_PER_CLOUD=20
   DEVICE=cuda
+  DATA_PARALLEL=1
   NUM_WORKERS=8
 
 Example:
@@ -73,6 +74,7 @@ BATCH_SIZE="${BATCH_SIZE:-128}"
 SAMPLES_PER_CLOUD="${SAMPLES_PER_CLOUD:-20}"
 LR="${LR:-1e-3}"
 DEVICE="${DEVICE:-auto}"
+DATA_PARALLEL="${DATA_PARALLEL:-0}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 
 SKIP_DOWNLOAD="${SKIP_DOWNLOAD:-0}"
@@ -202,6 +204,10 @@ train_classifier() {
     return
   fi
   log "Starting uprightness binary-classifier training"
+  extra_train_args=()
+  if [[ "$DATA_PARALLEL" == "1" ]]; then
+    extra_train_args+=(--data-parallel)
+  fi
   "$PYTHON" scripts/train_uprightness_classifier.py \
     --train-npz "$NPZ_ROOT/train.npz" \
     --test-npz "$NPZ_ROOT/test.npz" \
@@ -211,7 +217,8 @@ train_classifier() {
     --samples-per-cloud "$SAMPLES_PER_CLOUD" \
     --lr "$LR" \
     --num-workers "$NUM_WORKERS" \
-    --device "$DEVICE"
+    --device "$DEVICE" \
+    "${extra_train_args[@]}"
 }
 
 log "Pipeline root: $ROOT_DIR"

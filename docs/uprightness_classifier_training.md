@@ -147,6 +147,29 @@ python scripts/train_uprightness_classifier.py \
   --device cuda
 ```
 
+双卡训练：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python scripts/train_uprightness_classifier.py \
+  --train-npz datasets/uprightness_partial_npz/train.npz \
+  --test-npz datasets/uprightness_partial_npz/test.npz \
+  --out-dir models/uprightness_classifier \
+  --epochs 80 \
+  --batch-size 256 \
+  --samples-per-cloud 20 \
+  --lr 1e-3 \
+  --num-workers 12 \
+  --device cuda \
+  --data-parallel
+```
+
+一步到位双卡：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 DEVICE=cuda DATA_PARALLEL=1 BATCH_SIZE=256 \
+  ./scripts/run_modelnet15_uprightness_pipeline.sh
+```
+
 输出：
 
 ```text

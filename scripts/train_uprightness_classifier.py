@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-points", type=int, default=2048)
     p.add_argument("--seed", type=int, default=2026)
     p.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
+    p.add_argument(
+        "--data-parallel",
+        action="store_true",
+        help="Use torch.nn.DataParallel across visible CUDA devices.",
+    )
     p.add_argument("--pos-jitter-deg", type=float, default=5.0)
     p.add_argument("--neg-min-angle-deg", type=float, default=30.0)
     p.add_argument("--neg-max-angle-deg", type=float, default=150.0)
@@ -440,6 +445,14 @@ def main() -> None:
     )
 
     model = PointNetUprightnessClassifier(hidden=args.hidden).to(device)
+    if args.data_parallel:
+        if device.type != "cuda":
+            raise ValueError("--data-parallel requires --device cuda or CUDA auto-detection")
+        gpu_count = torch.cuda.device_count()
+        if gpu_count < 2:
+            raise ValueError(f"--data-parallel requested but only {gpu_count} CUDA device is visible")
+        model = nn.DataParallel(model)
+        print(f"data_parallel=True visible_cuda_devices={gpu_count}")
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -497,7 +510,7 @@ def main() -> None:
         if metrics["acc"] > best_acc:
             best_acc = metrics["acc"]
             ckpt = {
-                "model": model.state_dict(),
+                "model": model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
                 "args": vars(args),
                 "epoch": epoch,
                 "metrics": metrics,
@@ -508,7 +521,7 @@ def main() -> None:
 
     torch.save(
         {
-            "model": model.state_dict(),
+            "model": model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
             "args": vars(args),
             "epoch": args.epochs,
             "candidate_types": UprightnessCandidateDataset.candidate_types,
