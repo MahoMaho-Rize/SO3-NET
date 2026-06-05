@@ -21,6 +21,7 @@ datasets/uprightnet15_partial_camera/
 datasets/uprightnet15_partial_mesh/
 datasets/uprightnet15_partial_points/
 datasets/uprightness_partial_npz/
+datasets/upright_hierarchy_npz/
 
 # Local Blender source/build tree used for data generation experiments
 blender-pixi/
