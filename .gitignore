@@ -12,6 +12,7 @@ build/
 *.log
 datasets/uprightnet15/*.npy
 models/*.pth
+/*.pth
 
 # Downloaded / generated datasets
 datasets/downloads/
