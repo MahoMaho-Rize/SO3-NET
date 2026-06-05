@@ -28,6 +28,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=2026)
     p.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
+    p.add_argument(
+        "--arch",
+        default="dgcnn",
+        choices=("dgcnn", "pointnet"),
+        help="Point-wise hierarchy segmentation backbone.",
+    )
     p.add_argument("--hidden", type=int, default=512)
     p.add_argument("--dropout", type=float, default=0.2)
     p.add_argument("--class-balance", action="store_true")
@@ -108,7 +114,70 @@ class HierarchyDataset(Dataset):
         )
 
 
-class HierarchicalUprightNet(nn.Module):
+def knn(x: torch.Tensor, k: int) -> torch.Tensor:
+    inner = -2 * torch.matmul(x.transpose(2, 1), x)
+    xx = torch.sum(x**2, dim=1, keepdim=True)
+    pairwise_distance = -xx - inner - xx.transpose(2, 1)
+    return pairwise_distance.topk(k=k, dim=-1)[1]
+
+
+def get_graph_feature(
+    x: torch.Tensor, k: int = 20, idx: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size = x.size(0)
+    num_points = x.size(2)
+    x = x.view(batch_size, -1, num_points)
+    if idx is None:
+        idx = knn(x, k=k)
+
+    idx_out = idx
+    idx_base = torch.arange(0, batch_size, device=x.device).view(-1, 1, 1) * num_points
+    idx = (idx + idx_base).view(-1)
+
+    num_dims = x.size(1)
+    x_t = x.transpose(2, 1).contiguous()
+    feature = x_t.view(batch_size * num_points, -1)[idx, :]
+    feature = feature.view(batch_size, num_points, k, num_dims)
+    center = x_t.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)
+    feature = torch.cat((feature - center, center), dim=3)
+    return feature.permute(0, 3, 1, 2).contiguous(), idx_out
+
+
+class SelfAttentionLayer(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv_q = nn.Sequential(
+            nn.Conv1d(channels, channels, 1, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.LeakyReLU(negative_slope=0.2),
+        )
+        self.conv_k = nn.Sequential(
+            nn.Conv1d(channels, channels, 1, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.LeakyReLU(negative_slope=0.2),
+        )
+        self.conv_v = nn.Sequential(
+            nn.Conv1d(channels, channels, 1, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.LeakyReLU(negative_slope=0.2),
+        )
+        self.conv = nn.Sequential(
+            nn.Conv1d(channels, channels, 1, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.LeakyReLU(negative_slope=0.2),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_q = self.conv_q(x).permute(0, 2, 1)
+        x_k = self.conv_k(x)
+        x_v = self.conv_v(x)
+        attention = torch.bmm(x_q, x_k) / math.sqrt(x.size(1))
+        attention = F.softmax(attention, dim=1)
+        x_r = torch.bmm(x_v, attention)
+        return x + self.conv(x_r)
+
+
+class PointNetHierarchyNet(nn.Module):
     def __init__(self, num_levels: int, hidden: int = 512, dropout: float = 0.2):
         super().__init__()
         self.local = nn.Sequential(
@@ -141,6 +210,78 @@ class HierarchicalUprightNet(nn.Module):
         local = self.local(x)
         global_feat = local.max(dim=-1, keepdim=True)[0].expand_as(local)
         return self.seg(torch.cat([local, global_feat], dim=1))
+
+
+class DGCNNHierarchyNet(nn.Module):
+    def __init__(self, num_levels: int, dropout: float = 0.2, k: int = 20):
+        super().__init__()
+        self.k = k
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(6, 32, 1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(negative_slope=0.2),
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(64, 64, 1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(negative_slope=0.2),
+        )
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(128, 128, 1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(negative_slope=0.2),
+        )
+        self.sa1 = SelfAttentionLayer(128)
+        self.sa2 = SelfAttentionLayer(128)
+        self.sa3 = SelfAttentionLayer(128)
+        self.sa4 = SelfAttentionLayer(128)
+        self.conv4 = nn.Sequential(
+            nn.Conv1d(128 * 4, 1024, 1, bias=False),
+            nn.BatchNorm1d(1024),
+            nn.LeakyReLU(negative_slope=0.2),
+        )
+        self.conv5 = nn.Sequential(
+            nn.Conv1d(128 + 512 + 1024 + 1024, 512, 1, bias=False),
+            nn.BatchNorm1d(512),
+            nn.LeakyReLU(negative_slope=0.2),
+        )
+        self.conv6 = nn.Sequential(
+            nn.Conv1d(512, 64, 1, bias=False),
+            nn.BatchNorm1d(64),
+            nn.LeakyReLU(negative_slope=0.2),
+            nn.Dropout(dropout),
+        )
+        self.conv7 = nn.Conv1d(64, num_levels, 1)
+
+    def forward(self, points_bnc: torch.Tensor) -> torch.Tensor:
+        x = points_bnc.transpose(1, 2).contiguous()
+        batch_size = x.size(0)
+        num_points = x.size(2)
+
+        x, _ = get_graph_feature(x, k=self.k)
+        x = self.conv1(x).max(dim=-1, keepdim=False)[0]
+
+        x, _ = get_graph_feature(x, k=self.k)
+        x = self.conv2(x).max(dim=-1, keepdim=False)[0]
+
+        x, _ = get_graph_feature(x, k=self.k)
+        x = self.conv3(x)
+        x_a = x.max(dim=-1, keepdim=False)[0]
+
+        x1 = self.sa1(x_a)
+        x2 = self.sa2(x1)
+        x3 = self.sa3(x2)
+        x4 = self.sa4(x3)
+        x_b = torch.cat((x1, x2, x3, x4), dim=1)
+
+        x_c = self.conv4(x_b)
+        global_feat = F.adaptive_max_pool1d(x_c, 1).view(batch_size, -1)
+        x_global = global_feat.view(batch_size, -1, 1).repeat(1, 1, num_points)
+
+        x = torch.cat((x_a, x_b, x_c, x_global), dim=1)
+        x = self.conv5(x)
+        x = self.conv6(x)
+        return self.conv7(x)
 
 
 def direction_from_level_logits(points: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
@@ -284,7 +425,10 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    model = HierarchicalUprightNet(num_levels, args.hidden, args.dropout).to(device)
+    if args.arch == "dgcnn":
+        model = DGCNNHierarchyNet(num_levels, args.dropout).to(device)
+    else:
+        model = PointNetHierarchyNet(num_levels, args.hidden, args.dropout).to(device)
     if args.data_parallel:
         if device.type != "cuda":
             raise ValueError("--data-parallel requires CUDA")
@@ -306,6 +450,7 @@ def main() -> None:
     best_acc10 = -1.0
 
     print(f"device={device}")
+    print(f"arch={args.arch}")
     print(f"train_clouds={len(train_ds)} test_clouds={len(test_ds)} levels={num_levels}")
     if loss_weight is not None:
         print(f"class_weights={[round(float(x), 4) for x in loss_weight.detach().cpu()]}")
