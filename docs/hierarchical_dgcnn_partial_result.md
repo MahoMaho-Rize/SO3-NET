@@ -37,6 +37,23 @@ From `train_hierarchical_dgcnn.log`, epoch 80:
 |---|---|---:|---:|---:|---:|---:|---:|
 | Hierarchical DGCNN | partial test | 89.83% | 81.28% | 5.97 deg | 3.07 deg | 88.46% | 0.59% |
 
+## Direction Postprocessing Ablation
+
+The trained `final.pth` checkpoint was evaluated with three hierarchy-to-direction
+postprocessors:
+
+| Method | Loss | Point Acc | mIoU | Mean | Median | Acc@5 | Acc@10 | Acc@30 | Flip |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| LS | 0.4082 | 89.83% | 81.28% | 5.97 deg | 3.07 deg | 69.30% | 88.46% | 97.43% | 0.59% |
+| Weighted LS | 0.4082 | 89.83% | 81.28% | 5.95 deg | 3.08 deg | 69.33% | 88.45% | 97.53% | 0.58% |
+| Trimmed LS | 0.4082 | 89.83% | 81.28% | 6.45 deg | 3.28 deg | 65.84% | 85.28% | 97.43% | 0.59% |
+
+Weighted LS gives no meaningful gain over plain LS, while trimmed LS is worse.
+This suggests the remaining errors are not dominated by a small set of high
+residual outlier points; trimming removes useful geometric evidence.  The formal
+reported result should therefore use plain LS unless a later method clearly
+improves it.
+
 ## Baseline Comparison
 
 | Method | Test Data | Mean | Median | Acc@10 | Flip |
