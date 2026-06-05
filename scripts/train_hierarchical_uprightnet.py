@@ -39,6 +39,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--class-balance", action="store_true")
     p.add_argument("--data-parallel", action="store_true")
     p.add_argument("--log-csv", default="")
+    p.add_argument(
+        "--direction-method",
+        default="trimmed_ls",
+        choices=("ls", "weighted_ls", "trimmed_ls"),
+        help="Postprocess hierarchy logits into an upright direction.",
+    )
+    p.add_argument(
+        "--trim-fraction",
+        type=float,
+        default=0.10,
+        help="Fraction of highest-residual points removed by trimmed_ls.",
+    )
+    p.add_argument(
+        "--confidence-power",
+        type=float,
+        default=1.0,
+        help="Exponent applied to entropy confidence weights.",
+    )
+    p.add_argument(
+        "--min-confidence-weight",
+        type=float,
+        default=0.05,
+        help="Lower bound for confidence weights in weighted direction fitting.",
+    )
     return p.parse_args()
 
 
@@ -284,29 +308,66 @@ class DGCNNHierarchyNet(nn.Module):
         return self.conv7(x)
 
 
-def direction_from_level_logits(points: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+def _weighted_ls_direction(
+    points: torch.Tensor,
+    score: torch.Tensor,
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    weights = weights.clamp_min(1e-6)
+    weight_sum = weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    point_center = (points * weights.unsqueeze(-1)).sum(dim=1, keepdim=True) / weight_sum.unsqueeze(-1)
+    score_center = (score * weights).sum(dim=1, keepdim=True) / weight_sum
+    centered_points = points - point_center
+    centered_score = score - score_center
+
+    weighted_points = centered_points * weights.unsqueeze(-1)
+    cov = torch.bmm(centered_points.transpose(1, 2), weighted_points)
+    rhs = torch.bmm(
+        centered_points.transpose(1, 2), (centered_score * weights).unsqueeze(-1)
+    ).squeeze(-1)
+    eye = torch.eye(3, device=points.device, dtype=points.dtype).unsqueeze(0)
+    ridge = 1e-4 * float(points.shape[1])
+    direction = torch.linalg.solve(cov + ridge * eye, rhs.unsqueeze(-1)).squeeze(-1)
+    return direction, point_center.squeeze(1), score_center.squeeze(1)
+
+
+def direction_from_level_logits(
+    points: torch.Tensor,
+    logits: torch.Tensor,
+    method: str = "trimmed_ls",
+    trim_fraction: float = 0.10,
+    confidence_power: float = 1.0,
+    min_confidence_weight: float = 0.05,
+) -> torch.Tensor:
     probs = logits.softmax(dim=1)
     num_levels = logits.shape[1]
     levels = torch.linspace(0.0, 1.0, num_levels, device=logits.device).view(1, num_levels, 1)
     score = (probs * levels).sum(dim=1)
 
-    point_center = points.mean(dim=1, keepdim=True)
-    score_center = score.mean(dim=1, keepdim=True)
-    centered_points = points - point_center
-    centered_score = score - score_center
+    if method == "ls":
+        weights = torch.ones_like(score)
+    else:
+        entropy = -(probs.clamp_min(1e-8) * probs.clamp_min(1e-8).log()).sum(dim=1)
+        entropy = entropy / math.log(max(num_levels, 2))
+        confidence = (1.0 - entropy).clamp(0.0, 1.0)
+        if confidence_power != 1.0:
+            confidence = confidence.pow(confidence_power)
+        weights = confidence.clamp_min(min_confidence_weight)
 
-    # Fit score ~= a + dot(direction, point).  Direct covariance is biased by
-    # anisotropic object geometry; least squares whitens the point covariance.
-    cov = torch.bmm(centered_points.transpose(1, 2), centered_points)
-    rhs = torch.bmm(
-        centered_points.transpose(1, 2), centered_score.unsqueeze(-1)
-    ).squeeze(-1)
-    eye = torch.eye(3, device=points.device, dtype=points.dtype).unsqueeze(0)
-    ridge = 1e-4 * points.shape[1]
-    try:
-        direction = torch.linalg.solve(cov + ridge * eye, rhs.unsqueeze(-1)).squeeze(-1)
-    except RuntimeError:
-        direction = rhs
+    direction, point_center, score_center = _weighted_ls_direction(points, score, weights)
+
+    if method == "trimmed_ls" and trim_fraction > 0.0:
+        trim_fraction = min(max(trim_fraction, 0.0), 0.8)
+        keep_count = max(3, int(round(points.shape[1] * (1.0 - trim_fraction))))
+        pred_score = ((points - point_center.unsqueeze(1)) * direction.unsqueeze(1)).sum(dim=2)
+        pred_score = pred_score + score_center.unsqueeze(1)
+        residual = (score - pred_score).abs()
+        keep_idx = residual.topk(keep_count, dim=1, largest=False).indices
+        keep_mask = torch.zeros_like(weights)
+        keep_mask.scatter_(1, keep_idx, 1.0)
+        direction, _point_center, _score_center = _weighted_ls_direction(
+            points, score, weights * keep_mask
+        )
 
     low_w = probs[:, 0, :]
     high_w = probs[:, -1, :]
@@ -334,7 +395,17 @@ def miou_from_confusion(conf: np.ndarray) -> float:
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, num_levels: int, loss_weight):
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    num_levels: int,
+    loss_weight,
+    direction_method: str,
+    trim_fraction: float,
+    confidence_power: float,
+    min_confidence_weight: float,
+):
     model.eval()
     total_loss = 0.0
     total_points = 0
@@ -354,7 +425,14 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, num_lev
         total_points += labels.numel()
         correct += int((pred == labels).sum().item())
 
-        pred_up = direction_from_level_logits(points, logits)
+        pred_up = direction_from_level_logits(
+            points,
+            logits,
+            method=direction_method,
+            trim_fraction=trim_fraction,
+            confidence_power=confidence_power,
+            min_confidence_weight=min_confidence_weight,
+        )
         errors.append(angular_error_deg(pred_up, gt_up).detach().cpu())
 
         y = labels.detach().cpu().numpy().reshape(-1)
@@ -451,6 +529,10 @@ def main() -> None:
 
     print(f"device={device}")
     print(f"arch={args.arch}")
+    print(
+        f"direction_method={args.direction_method} trim_fraction={args.trim_fraction} "
+        f"confidence_power={args.confidence_power} min_confidence_weight={args.min_confidence_weight}"
+    )
     print(f"train_clouds={len(train_ds)} test_clouds={len(test_ds)} levels={num_levels}")
     if loss_weight is not None:
         print(f"class_weights={[round(float(x), 4) for x in loss_weight.detach().cpu()]}")
@@ -471,7 +553,17 @@ def main() -> None:
             count += labels.numel()
 
         scheduler.step()
-        metrics = evaluate(model, test_loader, device, num_levels, loss_weight)
+        metrics = evaluate(
+            model,
+            test_loader,
+            device,
+            num_levels,
+            loss_weight,
+            args.direction_method,
+            args.trim_fraction,
+            args.confidence_power,
+            args.min_confidence_weight,
+        )
         train_loss = running / max(count, 1)
         row = {"epoch": epoch, "train_loss": train_loss, **metrics}
         write_log(log_csv, row)
