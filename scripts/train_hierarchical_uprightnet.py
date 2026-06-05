@@ -151,7 +151,21 @@ def direction_from_level_logits(points: torch.Tensor, logits: torch.Tensor) -> t
 
     point_center = points.mean(dim=1, keepdim=True)
     score_center = score.mean(dim=1, keepdim=True)
-    cov = ((points - point_center) * (score - score_center).unsqueeze(-1)).sum(dim=1)
+    centered_points = points - point_center
+    centered_score = score - score_center
+
+    # Fit score ~= a + dot(direction, point).  Direct covariance is biased by
+    # anisotropic object geometry; least squares whitens the point covariance.
+    cov = torch.bmm(centered_points.transpose(1, 2), centered_points)
+    rhs = torch.bmm(
+        centered_points.transpose(1, 2), centered_score.unsqueeze(-1)
+    ).squeeze(-1)
+    eye = torch.eye(3, device=points.device, dtype=points.dtype).unsqueeze(0)
+    ridge = 1e-4 * points.shape[1]
+    try:
+        direction = torch.linalg.solve(cov + ridge * eye, rhs.unsqueeze(-1)).squeeze(-1)
+    except RuntimeError:
+        direction = rhs
 
     low_w = probs[:, 0, :]
     high_w = probs[:, -1, :]
@@ -159,8 +173,8 @@ def direction_from_level_logits(points: torch.Tensor, logits: torch.Tensor) -> t
     high = (points * high_w.unsqueeze(-1)).sum(dim=1) / high_w.sum(dim=1, keepdim=True).clamp_min(1e-6)
     fallback = high - low
 
-    use_fallback = cov.norm(dim=1, keepdim=True) < 1e-6
-    direction = torch.where(use_fallback, fallback, cov)
+    use_fallback = direction.norm(dim=1, keepdim=True) < 1e-6
+    direction = torch.where(use_fallback, fallback, direction)
     return F.normalize(direction, dim=1, eps=1e-6)
 
 
