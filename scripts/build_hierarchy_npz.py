@@ -99,11 +99,24 @@ def read_off_vertices(path: Path) -> np.ndarray:
         raise ValueError(f"{path}: malformed OFF counts line")
     num_vertices = int(counts[0])
     vertices = []
-    for _ in range(num_vertices):
-        parts = next(lines).split()
+    skipped = 0
+    for raw in lines:
+        if len(vertices) >= num_vertices:
+            break
+        parts = raw.split()
         if len(parts) < 3:
-            raise ValueError(f"{path}: malformed vertex line")
-        vertices.append((float(parts[0]), float(parts[1]), float(parts[2])))
+            skipped += 1
+            continue
+        try:
+            vertices.append((float(parts[0]), float(parts[1]), float(parts[2])))
+        except ValueError:
+            skipped += 1
+            continue
+    if len(vertices) < num_vertices:
+        raise ValueError(
+            f"{path}: expected {num_vertices} vertices, parsed {len(vertices)} "
+            f"(skipped {skipped} malformed lines)"
+        )
     if not vertices:
         raise ValueError(f"{path}: no vertices found")
     return np.asarray(vertices, dtype=np.float32)
@@ -277,13 +290,21 @@ def main() -> None:
         source_path = source_path_for(path, input_root, full_root, meta)
 
         if source_path.exists():
-            if source_path not in bbox_cache:
-                source_vertices = read_off_vertices(source_path)
-                bbox_cache[source_path] = (
-                    float(source_vertices[:, axis_idx].min()),
-                    float(source_vertices[:, axis_idx].max()),
+            try:
+                if source_path not in bbox_cache:
+                    source_vertices = read_off_vertices(source_path)
+                    bbox_cache[source_path] = (
+                        float(source_vertices[:, axis_idx].min()),
+                        float(source_vertices[:, axis_idx].max()),
+                    )
+                bbox_range = bbox_cache[source_path]
+            except ValueError as exc:
+                fallback_count += 1
+                print(f"[warn] {exc}; used partial bbox for {path}", flush=True)
+                bbox_range = (
+                    float(cloud[:, axis_idx].min()),
+                    float(cloud[:, axis_idx].max()),
                 )
-            bbox_range = bbox_cache[source_path]
         else:
             fallback_count += 1
             bbox_range = (float(cloud[:, axis_idx].min()), float(cloud[:, axis_idx].max()))
