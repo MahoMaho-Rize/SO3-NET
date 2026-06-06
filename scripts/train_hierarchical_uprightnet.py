@@ -106,12 +106,17 @@ class HierarchyDataset(Dataset):
         self.num_points = num_points
         self.seed = seed
         self.augment = augment
+        self.epoch = 0
 
     def __len__(self) -> int:
         return int(self.points.shape[0])
 
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
     def __getitem__(self, idx: int):
-        rng = np.random.default_rng(self.seed + idx * 1009)
+        epoch_offset = self.epoch * 1000003 if self.augment else 0
+        rng = np.random.default_rng(self.seed + idx * 1009 + epoch_offset)
         points = self.points[idx]
         labels = self.labels[idx]
 
@@ -538,6 +543,7 @@ def main() -> None:
         print(f"class_weights={[round(float(x), 4) for x in loss_weight.detach().cpu()]}")
 
     for epoch in range(1, args.epochs + 1):
+        train_ds.set_epoch(epoch)
         model.train()
         running = 0.0
         count = 0

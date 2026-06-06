@@ -242,6 +242,7 @@ def main() -> None:
         print(f"threshold_pos_weight={[round(float(x), 4) for x in flat]}")
 
     for epoch in range(1, args.epochs + 1):
+        train_ds.set_epoch(epoch)
         model.train()
         running = 0.0
         count = 0
