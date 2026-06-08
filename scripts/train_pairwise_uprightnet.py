@@ -41,8 +41,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--label-mode",
         default="sign",
-        choices=("sign", "delta"),
-        help="sign: lower/same/higher; delta: quantized relative height difference.",
+        choices=("sign", "delta", "threshold"),
+        help=(
+            "sign: lower/same/higher; delta: quantized relative height difference; "
+            "threshold: binary P(relative height difference > tau)."
+        ),
     )
     p.add_argument(
         "--delta-bins",
@@ -51,6 +54,12 @@ def parse_args() -> argparse.Namespace:
         help="Odd number of relative-height bins for --label-mode=delta.",
     )
     p.add_argument("--same-threshold-ratio", type=float, default=0.03)
+    p.add_argument(
+        "--eval-threshold-count",
+        type=int,
+        default=17,
+        help="Number of tau queries used to integrate threshold-mode predictions.",
+    )
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--num-workers", type=int, default=8)
@@ -116,7 +125,13 @@ class PairwiseUprightDataset(Dataset):
 
 
 class PointNetPairwiseNet(nn.Module):
-    def __init__(self, hidden: int = 256, dropout: float = 0.2, num_classes: int = 3):
+    def __init__(
+        self,
+        hidden: int = 256,
+        dropout: float = 0.2,
+        num_classes: int = 3,
+        pair_extra_dim: int = 0,
+    ):
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Conv1d(3, 64, 1, bias=False),
@@ -129,7 +144,7 @@ class PointNetPairwiseNet(nn.Module):
             nn.BatchNorm1d(hidden),
             nn.ReLU(inplace=True),
         )
-        self.head = PairHead(hidden, dropout, num_classes)
+        self.head = PairHead(hidden, dropout, num_classes, pair_extra_dim)
 
     def encode(self, points_bnc: torch.Tensor) -> torch.Tensor:
         return self.encoder(points_bnc.transpose(1, 2).contiguous()).transpose(1, 2)
@@ -139,9 +154,10 @@ class PointNetPairwiseNet(nn.Module):
         points_bnc: torch.Tensor,
         pair_i: torch.Tensor,
         pair_j: torch.Tensor,
+        pair_extra: torch.Tensor | None = None,
     ) -> torch.Tensor:
         feat = self.encode(points_bnc)
-        return self.head(points_bnc, feat, pair_i, pair_j)
+        return self.head(points_bnc, feat, pair_i, pair_j, pair_extra)
 
 
 class DGCNNPairwiseNet(nn.Module):
@@ -151,6 +167,7 @@ class DGCNNPairwiseNet(nn.Module):
         dropout: float = 0.2,
         k: int = 20,
         num_classes: int = 3,
+        pair_extra_dim: int = 0,
     ):
         super().__init__()
         self.k = k
@@ -184,7 +201,7 @@ class DGCNNPairwiseNet(nn.Module):
             nn.LeakyReLU(negative_slope=0.2),
             nn.Dropout(dropout),
         )
-        self.head = PairHead(hidden, dropout, num_classes)
+        self.head = PairHead(hidden, dropout, num_classes, pair_extra_dim)
 
     def encode(self, points_bnc: torch.Tensor) -> torch.Tensor:
         x = points_bnc.transpose(1, 2).contiguous()
@@ -219,16 +236,24 @@ class DGCNNPairwiseNet(nn.Module):
         points_bnc: torch.Tensor,
         pair_i: torch.Tensor,
         pair_j: torch.Tensor,
+        pair_extra: torch.Tensor | None = None,
     ) -> torch.Tensor:
         feat = self.encode(points_bnc)
-        return self.head(points_bnc, feat, pair_i, pair_j)
+        return self.head(points_bnc, feat, pair_i, pair_j, pair_extra)
 
 
 class PairHead(nn.Module):
-    def __init__(self, feat_dim: int, dropout: float, num_classes: int):
+    def __init__(
+        self,
+        feat_dim: int,
+        dropout: float,
+        num_classes: int,
+        pair_extra_dim: int = 0,
+    ):
         super().__init__()
         self.num_classes = num_classes
-        in_dim = feat_dim * 4 + 9
+        self.pair_extra_dim = pair_extra_dim
+        in_dim = feat_dim * 4 + 9 + pair_extra_dim
         self.net = nn.Sequential(
             nn.Linear(in_dim, 512),
             nn.BatchNorm1d(512),
@@ -246,15 +271,23 @@ class PairHead(nn.Module):
         feat: torch.Tensor,
         pair_i: torch.Tensor,
         pair_j: torch.Tensor,
+        pair_extra: torch.Tensor | None = None,
     ) -> torch.Tensor:
         pi = gather_batched(points, pair_i)
         pj = gather_batched(points, pair_j)
         fi = gather_batched(feat, pair_i)
         fj = gather_batched(feat, pair_j)
-        pair_feat = torch.cat(
-            [pi, pj, pi - pj, fi, fj, fi - fj, (fi - fj).abs()],
-            dim=-1,
-        )
+        chunks = [pi, pj, pi - pj, fi, fj, fi - fj, (fi - fj).abs()]
+        if self.pair_extra_dim:
+            if pair_extra is None:
+                raise ValueError("pair_extra is required for this PairHead")
+            if pair_extra.shape[-1] != self.pair_extra_dim:
+                raise ValueError(
+                    f"expected pair_extra dim {self.pair_extra_dim}, "
+                    f"got {pair_extra.shape[-1]}"
+                )
+            chunks.append(pair_extra)
+        pair_feat = torch.cat(chunks, dim=-1)
         flat = pair_feat.reshape(-1, pair_feat.shape[-1])
         logits = self.net(flat)
         return logits.view(pair_feat.shape[0], pair_feat.shape[1], self.num_classes)
@@ -330,6 +363,34 @@ def pair_delta_targets(
     return target.clamp(0, num_bins - 1)
 
 
+def pair_delta_values(
+    points: torch.Tensor,
+    up: torch.Tensor,
+    pair_i: torch.Tensor,
+    pair_j: torch.Tensor,
+) -> torch.Tensor:
+    height = (points * up.unsqueeze(1)).sum(dim=2)
+    hi = torch.gather(height, 1, pair_i)
+    hj = torch.gather(height, 1, pair_j)
+    span = (height.max(dim=1).values - height.min(dim=1).values).clamp_min(1e-6)
+    return ((hi - hj) / span.unsqueeze(1)).clamp(-1.0, 1.0)
+
+
+def sample_thresholds_like(delta: torch.Tensor) -> torch.Tensor:
+    return torch.rand_like(delta) * 2.0 - 1.0
+
+
+def deterministic_thresholds(pair_i: torch.Tensor, pair_j: torch.Tensor) -> torch.Tensor:
+    x = (pair_i.float() + 1.0) * 12.9898 + (pair_j.float() + 1.0) * 78.233
+    frac = torch.frac(torch.sin(x) * 43758.5453)
+    frac = torch.where(frac < 0.0, frac + 1.0, frac)
+    return frac * 2.0 - 1.0
+
+
+def threshold_targets(delta: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
+    return (delta > tau).float()
+
+
 def delta_bin_centers(num_bins: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     return torch.linspace(
         -1.0 + 1.0 / num_bins,
@@ -398,6 +459,65 @@ def direction_from_delta_targets(
     return direction_from_pair_scores(points, pair_i, pair_j, margin, weights)
 
 
+def direction_from_threshold_targets(
+    points: torch.Tensor,
+    pair_i: torch.Tensor,
+    pair_j: torch.Tensor,
+    delta: torch.Tensor,
+) -> torch.Tensor:
+    weights = torch.ones_like(delta)
+    return direction_from_pair_scores(points, pair_i, pair_j, delta, weights)
+
+
+def threshold_grid(
+    count: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if count < 2:
+        raise ValueError("--eval-threshold-count must be >= 2")
+    return torch.linspace(-1.0, 1.0, count, device=device, dtype=dtype)
+
+
+def margin_from_threshold_probs(probs: torch.Tensor, taus: torch.Tensor) -> torch.Tensor:
+    # For x in [-1, 1], x = integral_{-1}^{1} 1[x > tau] d tau - 1.
+    integral = torch.trapz(probs, taus, dim=-1)
+    return (integral - 1.0).clamp(-1.0, 1.0)
+
+
+@torch.no_grad()
+def direction_from_threshold_model(
+    model: nn.Module,
+    points: torch.Tensor,
+    pair_i: torch.Tensor,
+    pair_j: torch.Tensor,
+    threshold_count: int,
+    confidence_power: float,
+) -> torch.Tensor:
+    net = model.module if isinstance(model, nn.DataParallel) else model
+    feat = net.encode(points)
+    taus = threshold_grid(threshold_count, points.device, points.dtype)
+    probs = []
+    for tau in taus:
+        pair_extra = torch.full(
+            (*pair_i.shape, 1),
+            float(tau),
+            device=points.device,
+            dtype=points.dtype,
+        )
+        logits = net.head(points, feat, pair_i, pair_j, pair_extra).squeeze(-1)
+        probs.append(torch.sigmoid(logits))
+    prob = torch.stack(probs, dim=-1)
+    margin = margin_from_threshold_probs(prob, taus)
+
+    # Confidence is highest when the threshold curve is steep and away from 0.5.
+    confidence = (prob - 0.5).abs().mean(dim=-1) * 2.0
+    confidence = confidence.clamp(0.0, 1.0)
+    if confidence_power != 1.0:
+        confidence = confidence.pow(confidence_power)
+    return direction_from_pair_scores(points, pair_i, pair_j, margin, confidence)
+
+
 def direction_from_pair_scores(
     points: torch.Tensor,
     pair_i: torch.Tensor,
@@ -447,6 +567,8 @@ def delta_metrics(pred: torch.Tensor, target: torch.Tensor, num_bins: int) -> di
 def pair_class_names(label_mode: str, num_classes: int) -> list[str]:
     if label_mode == "sign":
         return ["lower", "same", "higher"]
+    if label_mode == "threshold":
+        return ["delta_gt_tau"]
     return [f"delta_bin_{idx:02d}" for idx in range(num_classes)]
 
 
@@ -458,6 +580,7 @@ def evaluate(
     eval_pairs_per_cloud: int,
     label_mode: str,
     delta_bins: int,
+    eval_threshold_count: int,
     same_threshold_ratio: float,
     confidence_power: float,
 ) -> dict[str, float]:
@@ -481,39 +604,64 @@ def evaluate(
         )
         if label_mode == "sign":
             target = pair_targets(points, gt_up, pair_i, pair_j, same_threshold_ratio)
-        else:
+            logits = model(points, pair_i, pair_j)
+            loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
+            pred = logits.argmax(dim=-1)
+        elif label_mode == "delta":
             target = pair_delta_targets(points, gt_up, pair_i, pair_j, delta_bins)
-        logits = model(points, pair_i, pair_j)
-        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
-        pred = logits.argmax(dim=-1)
+            logits = model(points, pair_i, pair_j)
+            loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
+            pred = logits.argmax(dim=-1)
+        else:
+            delta = pair_delta_values(points, gt_up, pair_i, pair_j)
+            tau = deterministic_thresholds(pair_i, pair_j)
+            target = threshold_targets(delta, tau)
+            logits = model(points, pair_i, pair_j, tau.unsqueeze(-1)).squeeze(-1)
+            loss = F.binary_cross_entropy_with_logits(logits, target)
+            pred = (logits > 0.0).long()
 
         total_loss += float(loss.detach().cpu()) * target.numel()
         total_pairs += target.numel()
-        total_correct += int((pred == target).sum().item())
+        if label_mode == "threshold":
+            total_correct += int((pred.float() == target).sum().item())
+        else:
+            total_correct += int((pred == target).sum().item())
         if label_mode == "sign":
             for cls in range(3):
                 mask = target == cls
                 class_total[cls] += int(mask.sum().item())
                 class_correct[cls] += int((pred[mask] == cls).sum().item())
-        else:
+        elif label_mode == "delta":
             center = delta_bins // 2
             pred_sign = torch.sign((pred - center).float())
             target_sign = torch.sign((target - center).float())
             sign_correct += int((pred_sign == target_sign).sum().item())
             bin_abs_error += float((pred - target).abs().float().sum().detach().cpu())
+        else:
+            sign_correct += int((pred.float() == target).sum().item())
 
         if label_mode == "sign":
             pred_up = direction_from_pair_logits(
                 points, pair_i, pair_j, logits, confidence_power
             )
             oracle_up = direction_from_pair_targets(points, pair_i, pair_j, target)
-        else:
+        elif label_mode == "delta":
             pred_up = direction_from_delta_logits(
                 points, pair_i, pair_j, logits, confidence_power
             )
             oracle_up = direction_from_delta_targets(
                 points, pair_i, pair_j, target, delta_bins
             )
+        else:
+            pred_up = direction_from_threshold_model(
+                model,
+                points,
+                pair_i,
+                pair_j,
+                eval_threshold_count,
+                confidence_power,
+            )
+            oracle_up = direction_from_threshold_targets(points, pair_i, pair_j, delta)
         pred_err = angular_error_deg(pred_up, gt_up)
         oracle_err = angular_error_deg(oracle_up, gt_up)
         errors.append(pred_err.detach().cpu())
@@ -552,7 +700,7 @@ def evaluate(
                 "bin_mae": 0.0,
             }
         )
-    else:
+    elif label_mode == "delta":
         out.update(
             {
                 "lower_acc": 0.0,
@@ -560,6 +708,16 @@ def evaluate(
                 "higher_acc": 0.0,
                 "sign_acc": sign_correct / max(total_pairs, 1),
                 "bin_mae": bin_abs_error / max(total_pairs, 1),
+            }
+        )
+    else:
+        out.update(
+            {
+                "lower_acc": 0.0,
+                "same_acc": 0.0,
+                "higher_acc": 0.0,
+                "sign_acc": sign_correct / max(total_pairs, 1),
+                "bin_mae": 0.0,
             }
         )
     return out
@@ -579,6 +737,8 @@ def main() -> None:
     args = parse_args()
     if args.label_mode == "delta" and (args.delta_bins < 3 or args.delta_bins % 2 == 0):
         raise ValueError("--delta-bins must be an odd integer >= 3")
+    if args.label_mode == "threshold" and args.eval_threshold_count < 2:
+        raise ValueError("--eval-threshold-count must be >= 2")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
@@ -614,14 +774,26 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
-    num_classes = 3 if args.label_mode == "sign" else args.delta_bins
+    if args.label_mode == "sign":
+        num_classes = 3
+    elif args.label_mode == "delta":
+        num_classes = args.delta_bins
+    else:
+        num_classes = 1
+    pair_extra_dim = 1 if args.label_mode == "threshold" else 0
     if args.arch == "dgcnn":
         model: nn.Module = DGCNNPairwiseNet(
-            args.hidden, args.dropout, num_classes=num_classes
+            args.hidden,
+            args.dropout,
+            num_classes=num_classes,
+            pair_extra_dim=pair_extra_dim,
         ).to(device)
     else:
         model = PointNetPairwiseNet(
-            args.hidden, args.dropout, num_classes=num_classes
+            args.hidden,
+            args.dropout,
+            num_classes=num_classes,
+            pair_extra_dim=pair_extra_dim,
         ).to(device)
     if args.data_parallel:
         if device.type != "cuda":
@@ -651,7 +823,7 @@ def main() -> None:
     )
     print(
         f"same_threshold_ratio={args.same_threshold_ratio} same_weight={args.same_weight} "
-        f"delta_bins={args.delta_bins} "
+        f"delta_bins={args.delta_bins} eval_threshold_count={args.eval_threshold_count} "
         f"confidence_power={args.confidence_power}"
     )
 
@@ -683,24 +855,42 @@ def main() -> None:
                 target = pair_targets(
                     points, gt_up, pair_i, pair_j, args.same_threshold_ratio
                 )
-            else:
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(points, pair_i, pair_j)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, num_classes), target.reshape(-1), weight=weight
+                )
+                pred_for_metrics = logits.argmax(dim=-1)
+            elif args.label_mode == "delta":
                 target = pair_delta_targets(
                     points, gt_up, pair_i, pair_j, args.delta_bins
                 )
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(points, pair_i, pair_j)
-            loss = F.cross_entropy(
-                logits.reshape(-1, num_classes), target.reshape(-1), weight=weight
-            )
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(points, pair_i, pair_j)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, num_classes), target.reshape(-1), weight=weight
+                )
+                pred_for_metrics = logits.argmax(dim=-1)
+            else:
+                delta = pair_delta_values(points, gt_up, pair_i, pair_j)
+                tau = sample_thresholds_like(delta)
+                target = threshold_targets(delta, tau)
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(points, pair_i, pair_j, tau.unsqueeze(-1)).squeeze(-1)
+                loss = F.binary_cross_entropy_with_logits(logits, target)
+                pred_for_metrics = (logits > 0.0).long()
             loss.backward()
             optimizer.step()
 
             running += float(loss.detach().cpu()) * target.numel()
             count += target.numel()
             if args.label_mode == "sign":
-                batch_rel = relation_metrics(logits.argmax(dim=-1), target)
+                batch_rel = relation_metrics(pred_for_metrics, target)
+            elif args.label_mode == "delta":
+                batch_rel = delta_metrics(pred_for_metrics, target, args.delta_bins)
             else:
-                batch_rel = delta_metrics(logits.argmax(dim=-1), target, args.delta_bins)
+                acc = float((pred_for_metrics.float() == target).float().mean().detach().cpu())
+                batch_rel = {"pair_acc": acc, "sign_acc": acc, "bin_mae": 0.0}
             for key, value in batch_rel.items():
                 rel_sum[key] += value
             rel_batches += 1
@@ -713,6 +903,7 @@ def main() -> None:
             args.eval_pairs_per_cloud,
             args.label_mode,
             args.delta_bins,
+            args.eval_threshold_count,
             args.same_threshold_ratio,
             args.confidence_power,
         )
@@ -727,11 +918,13 @@ def main() -> None:
                 f"same={metrics['same_acc']*100:.2f}% "
                 f"higher={metrics['higher_acc']*100:.2f}%"
             )
-        else:
+        elif args.label_mode == "delta":
             pair_detail = (
                 f"sign_acc={metrics['sign_acc']*100:.2f}% "
                 f"bin_mae={metrics['bin_mae']:.2f}"
             )
+        else:
+            pair_detail = f"threshold_acc={metrics['pair_acc']*100:.2f}%"
 
         print(
             f"epoch={epoch:03d} train_loss={train_loss:.4f} "

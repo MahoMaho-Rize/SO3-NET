@@ -20,6 +20,8 @@ from train_pairwise_uprightnet import (
     deterministic_pairs,
     direction_from_delta_targets,
     direction_from_pair_targets,
+    direction_from_threshold_targets,
+    pair_delta_values,
     pair_delta_targets,
     pair_targets,
 )
@@ -172,6 +174,43 @@ def eval_pairwise_delta_oracle(
     )
 
 
+@torch.no_grad()
+def eval_pairwise_threshold_oracle(
+    npz_path: str,
+    num_points: int,
+    batch_size: int,
+    num_workers: int,
+    limit: int,
+    seed: int,
+    device: torch.device,
+    pair_count: int,
+) -> None:
+    ds: Dataset = PairwiseUprightDataset(npz_path, num_points, seed + 100000, augment=False)
+    if limit > 0:
+        ds = Subset(ds, range(min(limit, len(ds))))
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+    errors = []
+    for points, gt_up, _cat in loader:
+        points = points.to(device)
+        gt_up = gt_up.to(device)
+        pair_i, pair_j = deterministic_pairs(
+            points.shape[0], points.shape[1], pair_count, device
+        )
+        delta = pair_delta_values(points, gt_up, pair_i, pair_j)
+        pred_up = direction_from_threshold_targets(points, pair_i, pair_j, delta)
+        errors.append(angular_error_deg(pred_up, gt_up).detach().cpu())
+    summarize(
+        f"pairwise_threshold_oracle pairs={pair_count}",
+        torch.cat(errors).numpy(),
+    )
+
+
 def main() -> None:
     args = parse_args()
     if args.device == "auto":
@@ -218,6 +257,16 @@ def main() -> None:
                     pair_count,
                     delta_bins,
                 )
+            eval_pairwise_threshold_oracle(
+                args.npz,
+                args.num_points,
+                args.batch_size,
+                args.num_workers,
+                args.limit,
+                args.seed,
+                device,
+                pair_count,
+            )
 
 
 if __name__ == "__main__":
