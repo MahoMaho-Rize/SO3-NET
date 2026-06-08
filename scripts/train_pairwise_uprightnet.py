@@ -38,6 +38,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-points", type=int, default=2048)
     p.add_argument("--pairs-per-cloud", type=int, default=4096)
     p.add_argument("--eval-pairs-per-cloud", type=int, default=8192)
+    p.add_argument(
+        "--label-mode",
+        default="sign",
+        choices=("sign", "delta"),
+        help="sign: lower/same/higher; delta: quantized relative height difference.",
+    )
+    p.add_argument(
+        "--delta-bins",
+        type=int,
+        default=9,
+        help="Odd number of relative-height bins for --label-mode=delta.",
+    )
     p.add_argument("--same-threshold-ratio", type=float, default=0.03)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
@@ -104,7 +116,7 @@ class PairwiseUprightDataset(Dataset):
 
 
 class PointNetPairwiseNet(nn.Module):
-    def __init__(self, hidden: int = 256, dropout: float = 0.2):
+    def __init__(self, hidden: int = 256, dropout: float = 0.2, num_classes: int = 3):
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Conv1d(3, 64, 1, bias=False),
@@ -117,7 +129,7 @@ class PointNetPairwiseNet(nn.Module):
             nn.BatchNorm1d(hidden),
             nn.ReLU(inplace=True),
         )
-        self.head = PairHead(hidden, dropout)
+        self.head = PairHead(hidden, dropout, num_classes)
 
     def encode(self, points_bnc: torch.Tensor) -> torch.Tensor:
         return self.encoder(points_bnc.transpose(1, 2).contiguous()).transpose(1, 2)
@@ -133,7 +145,13 @@ class PointNetPairwiseNet(nn.Module):
 
 
 class DGCNNPairwiseNet(nn.Module):
-    def __init__(self, hidden: int = 256, dropout: float = 0.2, k: int = 20):
+    def __init__(
+        self,
+        hidden: int = 256,
+        dropout: float = 0.2,
+        k: int = 20,
+        num_classes: int = 3,
+    ):
         super().__init__()
         self.k = k
         self.conv1 = nn.Sequential(
@@ -166,7 +184,7 @@ class DGCNNPairwiseNet(nn.Module):
             nn.LeakyReLU(negative_slope=0.2),
             nn.Dropout(dropout),
         )
-        self.head = PairHead(hidden, dropout)
+        self.head = PairHead(hidden, dropout, num_classes)
 
     def encode(self, points_bnc: torch.Tensor) -> torch.Tensor:
         x = points_bnc.transpose(1, 2).contiguous()
@@ -207,8 +225,9 @@ class DGCNNPairwiseNet(nn.Module):
 
 
 class PairHead(nn.Module):
-    def __init__(self, feat_dim: int, dropout: float):
+    def __init__(self, feat_dim: int, dropout: float, num_classes: int):
         super().__init__()
+        self.num_classes = num_classes
         in_dim = feat_dim * 4 + 9
         self.net = nn.Sequential(
             nn.Linear(in_dim, 512),
@@ -218,7 +237,7 @@ class PairHead(nn.Module):
             nn.Linear(512, 256),
             nn.BatchNorm1d(256),
             nn.LeakyReLU(negative_slope=0.2),
-            nn.Linear(256, 3),
+            nn.Linear(256, num_classes),
         )
 
     def forward(
@@ -238,7 +257,7 @@ class PairHead(nn.Module):
         )
         flat = pair_feat.reshape(-1, pair_feat.shape[-1])
         logits = self.net(flat)
-        return logits.view(pair_feat.shape[0], pair_feat.shape[1], 3)
+        return logits.view(pair_feat.shape[0], pair_feat.shape[1], self.num_classes)
 
 
 def gather_batched(values: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
@@ -295,6 +314,32 @@ def pair_targets(
     return target
 
 
+def pair_delta_targets(
+    points: torch.Tensor,
+    up: torch.Tensor,
+    pair_i: torch.Tensor,
+    pair_j: torch.Tensor,
+    num_bins: int,
+) -> torch.Tensor:
+    height = (points * up.unsqueeze(1)).sum(dim=2)
+    hi = torch.gather(height, 1, pair_i)
+    hj = torch.gather(height, 1, pair_j)
+    span = (height.max(dim=1).values - height.min(dim=1).values).clamp_min(1e-6)
+    delta = ((hi - hj) / span.unsqueeze(1)).clamp(-1.0, 1.0 - 1e-7)
+    target = torch.floor((delta + 1.0) * (0.5 * num_bins)).long()
+    return target.clamp(0, num_bins - 1)
+
+
+def delta_bin_centers(num_bins: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    return torch.linspace(
+        -1.0 + 1.0 / num_bins,
+        1.0 - 1.0 / num_bins,
+        num_bins,
+        device=device,
+        dtype=dtype,
+    )
+
+
 def direction_from_pair_logits(
     points: torch.Tensor,
     pair_i: torch.Tensor,
@@ -311,6 +356,24 @@ def direction_from_pair_logits(
     return direction_from_pair_scores(points, pair_i, pair_j, sign, weights)
 
 
+def direction_from_delta_logits(
+    points: torch.Tensor,
+    pair_i: torch.Tensor,
+    pair_j: torch.Tensor,
+    logits: torch.Tensor,
+    confidence_power: float,
+) -> torch.Tensor:
+    probs = logits.softmax(dim=-1)
+    centers = delta_bin_centers(logits.shape[-1], logits.device, logits.dtype)
+    margin = (probs * centers.view(1, 1, -1)).sum(dim=-1)
+    entropy = -(probs.clamp_min(1e-8) * probs.clamp_min(1e-8).log()).sum(dim=-1)
+    entropy = entropy / math.log(max(logits.shape[-1], 2))
+    weights = (1.0 - entropy).clamp(0.0, 1.0)
+    if confidence_power != 1.0:
+        weights = weights.pow(confidence_power)
+    return direction_from_pair_scores(points, pair_i, pair_j, margin, weights)
+
+
 def direction_from_pair_targets(
     points: torch.Tensor,
     pair_i: torch.Tensor,
@@ -320,6 +383,19 @@ def direction_from_pair_targets(
     sign = (target == HIGHER).float() - (target == LOWER).float()
     weights = sign.abs()
     return direction_from_pair_scores(points, pair_i, pair_j, sign, weights)
+
+
+def direction_from_delta_targets(
+    points: torch.Tensor,
+    pair_i: torch.Tensor,
+    pair_j: torch.Tensor,
+    target: torch.Tensor,
+    num_bins: int,
+) -> torch.Tensor:
+    centers = delta_bin_centers(num_bins, points.device, points.dtype)
+    margin = centers[target]
+    weights = torch.ones_like(margin)
+    return direction_from_pair_scores(points, pair_i, pair_j, margin, weights)
 
 
 def direction_from_pair_scores(
@@ -357,12 +433,31 @@ def relation_metrics(pred: torch.Tensor, target: torch.Tensor) -> dict[str, floa
     return out
 
 
+def delta_metrics(pred: torch.Tensor, target: torch.Tensor, num_bins: int) -> dict[str, float]:
+    center = num_bins // 2
+    pred_sign = torch.sign((pred - center).float())
+    target_sign = torch.sign((target - center).float())
+    return {
+        "pair_acc": float((pred == target).float().mean().detach().cpu()),
+        "sign_acc": float((pred_sign == target_sign).float().mean().detach().cpu()),
+        "bin_mae": float((pred - target).abs().float().mean().detach().cpu()),
+    }
+
+
+def pair_class_names(label_mode: str, num_classes: int) -> list[str]:
+    if label_mode == "sign":
+        return ["lower", "same", "higher"]
+    return [f"delta_bin_{idx:02d}" for idx in range(num_classes)]
+
+
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
     eval_pairs_per_cloud: int,
+    label_mode: str,
+    delta_bins: int,
     same_threshold_ratio: float,
     confidence_power: float,
 ) -> dict[str, float]:
@@ -370,6 +465,8 @@ def evaluate(
     total_loss = 0.0
     total_pairs = 0
     total_correct = 0
+    sign_correct = 0
+    bin_abs_error = 0.0
     class_correct = torch.zeros(3, dtype=torch.float64)
     class_total = torch.zeros(3, dtype=torch.float64)
     errors = []
@@ -382,24 +479,42 @@ def evaluate(
         pair_i, pair_j = deterministic_pairs(
             points.shape[0], points.shape[1], eval_pairs_per_cloud, device
         )
-        target = pair_targets(points, gt_up, pair_i, pair_j, same_threshold_ratio)
+        if label_mode == "sign":
+            target = pair_targets(points, gt_up, pair_i, pair_j, same_threshold_ratio)
+        else:
+            target = pair_delta_targets(points, gt_up, pair_i, pair_j, delta_bins)
         logits = model(points, pair_i, pair_j)
-        loss = F.cross_entropy(logits.reshape(-1, 3), target.reshape(-1))
+        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
         pred = logits.argmax(dim=-1)
 
         total_loss += float(loss.detach().cpu()) * target.numel()
         total_pairs += target.numel()
         total_correct += int((pred == target).sum().item())
-        for cls in range(3):
-            mask = target == cls
-            class_total[cls] += int(mask.sum().item())
-            class_correct[cls] += int((pred[mask] == cls).sum().item())
+        if label_mode == "sign":
+            for cls in range(3):
+                mask = target == cls
+                class_total[cls] += int(mask.sum().item())
+                class_correct[cls] += int((pred[mask] == cls).sum().item())
+        else:
+            center = delta_bins // 2
+            pred_sign = torch.sign((pred - center).float())
+            target_sign = torch.sign((target - center).float())
+            sign_correct += int((pred_sign == target_sign).sum().item())
+            bin_abs_error += float((pred - target).abs().float().sum().detach().cpu())
 
-        pred_up = direction_from_pair_logits(
-            points, pair_i, pair_j, logits, confidence_power
-        )
+        if label_mode == "sign":
+            pred_up = direction_from_pair_logits(
+                points, pair_i, pair_j, logits, confidence_power
+            )
+            oracle_up = direction_from_pair_targets(points, pair_i, pair_j, target)
+        else:
+            pred_up = direction_from_delta_logits(
+                points, pair_i, pair_j, logits, confidence_power
+            )
+            oracle_up = direction_from_delta_targets(
+                points, pair_i, pair_j, target, delta_bins
+            )
         pred_err = angular_error_deg(pred_up, gt_up)
-        oracle_up = direction_from_pair_targets(points, pair_i, pair_j, target)
         oracle_err = angular_error_deg(oracle_up, gt_up)
         errors.append(pred_err.detach().cpu())
         oracle_errors.append(oracle_err.detach().cpu())
@@ -412,13 +527,9 @@ def evaluate(
     oracle_gap = (
         torch.cat(oracle_gaps).numpy() if oracle_gaps else np.asarray([], dtype=np.float32)
     )
-    per_class = class_correct / class_total.clamp_min(1.0)
-    return {
+    out = {
         "loss": total_loss / max(total_pairs, 1),
         "pair_acc": total_correct / max(total_pairs, 1),
-        "lower_acc": float(per_class[LOWER]),
-        "same_acc": float(per_class[SAME]),
-        "higher_acc": float(per_class[HIGHER]),
         "mean_err": float(err.mean()) if len(err) else float("nan"),
         "median_err": float(np.median(err)) if len(err) else float("nan"),
         "acc5": float((err < 5).mean()) if len(err) else 0.0,
@@ -430,6 +541,28 @@ def evaluate(
         "oracle_acc10": float((oracle_err < 10).mean()) if len(oracle_err) else 0.0,
         "oracle_gap_mean": float(oracle_gap.mean()) if len(oracle_gap) else float("nan"),
     }
+    if label_mode == "sign":
+        per_class = class_correct / class_total.clamp_min(1.0)
+        out.update(
+            {
+                "lower_acc": float(per_class[LOWER]),
+                "same_acc": float(per_class[SAME]),
+                "higher_acc": float(per_class[HIGHER]),
+                "sign_acc": total_correct / max(total_pairs, 1),
+                "bin_mae": 0.0,
+            }
+        )
+    else:
+        out.update(
+            {
+                "lower_acc": 0.0,
+                "same_acc": 0.0,
+                "higher_acc": 0.0,
+                "sign_acc": sign_correct / max(total_pairs, 1),
+                "bin_mae": bin_abs_error / max(total_pairs, 1),
+            }
+        )
+    return out
 
 
 def write_log(path: Path, row: dict[str, float | int]) -> None:
@@ -444,6 +577,8 @@ def write_log(path: Path, row: dict[str, float | int]) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.label_mode == "delta" and (args.delta_bins < 3 or args.delta_bins % 2 == 0):
+        raise ValueError("--delta-bins must be an odd integer >= 3")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
@@ -479,16 +614,26 @@ def main() -> None:
         pin_memory=(device.type == "cuda"),
     )
 
+    num_classes = 3 if args.label_mode == "sign" else args.delta_bins
     if args.arch == "dgcnn":
-        model: nn.Module = DGCNNPairwiseNet(args.hidden, args.dropout).to(device)
+        model: nn.Module = DGCNNPairwiseNet(
+            args.hidden, args.dropout, num_classes=num_classes
+        ).to(device)
     else:
-        model = PointNetPairwiseNet(args.hidden, args.dropout).to(device)
+        model = PointNetPairwiseNet(
+            args.hidden, args.dropout, num_classes=num_classes
+        ).to(device)
     if args.data_parallel:
         if device.type != "cuda":
             raise ValueError("--data-parallel requires CUDA")
         model = nn.DataParallel(model)
 
-    weight = torch.tensor([1.0, args.same_weight, 1.0], dtype=torch.float32, device=device)
+    if args.label_mode == "sign":
+        weight = torch.tensor(
+            [1.0, args.same_weight, 1.0], dtype=torch.float32, device=device
+        )
+    else:
+        weight = None
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.05
@@ -499,13 +644,14 @@ def main() -> None:
     log_csv = Path(args.log_csv) if args.log_csv else out_dir / "train_log.csv"
     best_acc10 = -1.0
 
-    print(f"device={device} arch={args.arch}")
+    print(f"device={device} arch={args.arch} label_mode={args.label_mode} classes={num_classes}")
     print(
         f"train_clouds={len(train_ds)} test_clouds={len(test_ds)} "
         f"pairs_per_cloud={args.pairs_per_cloud} eval_pairs_per_cloud={args.eval_pairs_per_cloud}"
     )
     print(
         f"same_threshold_ratio={args.same_threshold_ratio} same_weight={args.same_weight} "
+        f"delta_bins={args.delta_bins} "
         f"confidence_power={args.confidence_power}"
     )
 
@@ -518,7 +664,14 @@ def main() -> None:
         model.train()
         running = 0.0
         count = 0
-        rel_sum = {"pair_acc": 0.0, "lower_acc": 0.0, "same_acc": 0.0, "higher_acc": 0.0}
+        rel_sum = {
+            "pair_acc": 0.0,
+            "lower_acc": 0.0,
+            "same_acc": 0.0,
+            "higher_acc": 0.0,
+            "sign_acc": 0.0,
+            "bin_mae": 0.0,
+        }
         rel_batches = 0
         for points, gt_up, _cat in train_loader:
             points = points.to(device)
@@ -526,20 +679,28 @@ def main() -> None:
             pair_i, pair_j = sample_pairs(
                 points.shape[0], points.shape[1], args.pairs_per_cloud, device
             )
-            target = pair_targets(
-                points, gt_up, pair_i, pair_j, args.same_threshold_ratio
-            )
+            if args.label_mode == "sign":
+                target = pair_targets(
+                    points, gt_up, pair_i, pair_j, args.same_threshold_ratio
+                )
+            else:
+                target = pair_delta_targets(
+                    points, gt_up, pair_i, pair_j, args.delta_bins
+                )
             optimizer.zero_grad(set_to_none=True)
             logits = model(points, pair_i, pair_j)
             loss = F.cross_entropy(
-                logits.reshape(-1, 3), target.reshape(-1), weight=weight
+                logits.reshape(-1, num_classes), target.reshape(-1), weight=weight
             )
             loss.backward()
             optimizer.step()
 
             running += float(loss.detach().cpu()) * target.numel()
             count += target.numel()
-            batch_rel = relation_metrics(logits.argmax(dim=-1), target)
+            if args.label_mode == "sign":
+                batch_rel = relation_metrics(logits.argmax(dim=-1), target)
+            else:
+                batch_rel = delta_metrics(logits.argmax(dim=-1), target, args.delta_bins)
             for key, value in batch_rel.items():
                 rel_sum[key] += value
             rel_batches += 1
@@ -550,6 +711,8 @@ def main() -> None:
             test_loader,
             device,
             args.eval_pairs_per_cloud,
+            args.label_mode,
+            args.delta_bins,
             args.same_threshold_ratio,
             args.confidence_power,
         )
@@ -562,6 +725,7 @@ def main() -> None:
             f"epoch={epoch:03d} train_loss={train_loss:.4f} "
             f"train_pair_acc={train_pair_acc*100:.2f}% val_loss={metrics['loss']:.4f} "
             f"pair_acc={metrics['pair_acc']*100:.2f}% "
+            f"sign_acc={metrics['sign_acc']*100:.2f}% bin_mae={metrics['bin_mae']:.2f} "
             f"lower={metrics['lower_acc']*100:.2f}% same={metrics['same_acc']*100:.2f}% "
             f"higher={metrics['higher_acc']*100:.2f}% "
             f"mean={metrics['mean_err']:.2f} median={metrics['median_err']:.2f} "
@@ -577,7 +741,7 @@ def main() -> None:
                     "model": model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
                     "args": vars(args),
                     "metrics": metrics,
-                    "pair_classes": ["lower", "same", "higher"],
+                    "pair_classes": pair_class_names(args.label_mode, num_classes),
                 },
                 out_dir / "best.pth",
             )
@@ -587,7 +751,7 @@ def main() -> None:
         {
             "model": model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
             "args": vars(args),
-            "pair_classes": ["lower", "same", "higher"],
+            "pair_classes": pair_class_names(args.label_mode, num_classes),
         },
         out_dir / "final.pth",
     )

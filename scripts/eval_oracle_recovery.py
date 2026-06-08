@@ -18,7 +18,9 @@ from train_hierarchical_uprightnet import (
 from train_pairwise_uprightnet import (
     PairwiseUprightDataset,
     deterministic_pairs,
+    direction_from_delta_targets,
     direction_from_pair_targets,
+    pair_delta_targets,
     pair_targets,
 )
 
@@ -34,6 +36,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     p.add_argument("--same-threshold-ratio", type=float, default=0.03)
     p.add_argument("--skip-pairwise", action="store_true")
+    p.add_argument(
+        "--delta-bins",
+        type=int,
+        nargs="+",
+        default=[9, 17],
+        help="Pairwise relative-height bin counts for delta oracle.",
+    )
     p.add_argument(
         "--pair-counts",
         type=int,
@@ -125,6 +134,44 @@ def eval_pairwise_oracle(
     summarize(f"pairwise_ls_oracle pairs={pair_count}", torch.cat(errors).numpy())
 
 
+@torch.no_grad()
+def eval_pairwise_delta_oracle(
+    npz_path: str,
+    num_points: int,
+    batch_size: int,
+    num_workers: int,
+    limit: int,
+    seed: int,
+    device: torch.device,
+    pair_count: int,
+    delta_bins: int,
+) -> None:
+    ds: Dataset = PairwiseUprightDataset(npz_path, num_points, seed + 100000, augment=False)
+    if limit > 0:
+        ds = Subset(ds, range(min(limit, len(ds))))
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+    errors = []
+    for points, gt_up, _cat in loader:
+        points = points.to(device)
+        gt_up = gt_up.to(device)
+        pair_i, pair_j = deterministic_pairs(
+            points.shape[0], points.shape[1], pair_count, device
+        )
+        target = pair_delta_targets(points, gt_up, pair_i, pair_j, delta_bins)
+        pred_up = direction_from_delta_targets(points, pair_i, pair_j, target, delta_bins)
+        errors.append(angular_error_deg(pred_up, gt_up).detach().cpu())
+    summarize(
+        f"pairwise_delta_oracle bins={delta_bins} pairs={pair_count}",
+        torch.cat(errors).numpy(),
+    )
+
+
 def main() -> None:
     args = parse_args()
     if args.device == "auto":
@@ -159,6 +206,18 @@ def main() -> None:
                 args.same_threshold_ratio,
                 pair_count,
             )
+            for delta_bins in args.delta_bins:
+                eval_pairwise_delta_oracle(
+                    args.npz,
+                    args.num_points,
+                    args.batch_size,
+                    args.num_workers,
+                    args.limit,
+                    args.seed,
+                    device,
+                    pair_count,
+                    delta_bins,
+                )
 
 
 if __name__ == "__main__":
