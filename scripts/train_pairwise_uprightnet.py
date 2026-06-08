@@ -721,13 +721,22 @@ def main() -> None:
         row = {"epoch": epoch, "train_loss": train_loss, "train_pair_acc": train_pair_acc, **metrics}
         write_log(log_csv, row)
 
+        if args.label_mode == "sign":
+            pair_detail = (
+                f"lower={metrics['lower_acc']*100:.2f}% "
+                f"same={metrics['same_acc']*100:.2f}% "
+                f"higher={metrics['higher_acc']*100:.2f}%"
+            )
+        else:
+            pair_detail = (
+                f"sign_acc={metrics['sign_acc']*100:.2f}% "
+                f"bin_mae={metrics['bin_mae']:.2f}"
+            )
+
         print(
             f"epoch={epoch:03d} train_loss={train_loss:.4f} "
             f"train_pair_acc={train_pair_acc*100:.2f}% val_loss={metrics['loss']:.4f} "
-            f"pair_acc={metrics['pair_acc']*100:.2f}% "
-            f"sign_acc={metrics['sign_acc']*100:.2f}% bin_mae={metrics['bin_mae']:.2f} "
-            f"lower={metrics['lower_acc']*100:.2f}% same={metrics['same_acc']*100:.2f}% "
-            f"higher={metrics['higher_acc']*100:.2f}% "
+            f"pair_acc={metrics['pair_acc']*100:.2f}% {pair_detail} "
             f"mean={metrics['mean_err']:.2f} median={metrics['median_err']:.2f} "
             f"acc10={metrics['acc10']*100:.2f}% flip={metrics['flip']*100:.2f}% "
             f"oracle10={metrics['oracle_acc10']*100:.2f}% gap={metrics['oracle_gap_mean']:.2f}",
