@@ -266,8 +266,9 @@ def deterministic_pairs(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     base = torch.arange(num_pairs, device=device)
-    pair_i = (base * 15485863) % num_points
-    pair_j = (base * 32452843 + 1) % num_points
+    cycle = base // num_points
+    pair_i = (base * 15485863 + cycle * 49979687) % num_points
+    pair_j = (base * 32452843 + cycle * 67867967 + 1) % num_points
     pair_i = pair_i.view(1, -1).repeat(batch_size, 1)
     pair_j = pair_j.view(1, -1).repeat(batch_size, 1)
     same = pair_i == pair_j
@@ -302,13 +303,47 @@ def direction_from_pair_logits(
     confidence_power: float,
 ) -> torch.Tensor:
     probs = logits.softmax(dim=-1)
-    sign_score = probs[..., HIGHER] - probs[..., LOWER]
+    raw_score = probs[..., HIGHER] - probs[..., LOWER]
+    sign = raw_score.sign()
+    weights = raw_score.abs()
     if confidence_power != 1.0:
-        sign_score = sign_score.sign() * sign_score.abs().pow(confidence_power)
+        weights = weights.pow(confidence_power)
+    return direction_from_pair_scores(points, pair_i, pair_j, sign, weights)
+
+
+def direction_from_pair_targets(
+    points: torch.Tensor,
+    pair_i: torch.Tensor,
+    pair_j: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    sign = (target == HIGHER).float() - (target == LOWER).float()
+    weights = sign.abs()
+    return direction_from_pair_scores(points, pair_i, pair_j, sign, weights)
+
+
+def direction_from_pair_scores(
+    points: torch.Tensor,
+    pair_i: torch.Tensor,
+    pair_j: torch.Tensor,
+    sign: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
     pi = gather_batched(points, pair_i)
     pj = gather_batched(points, pair_j)
-    vote = ((pi - pj) * sign_score.unsqueeze(-1)).sum(dim=1)
-    return F.normalize(vote, dim=1, eps=1e-6)
+    diff = pi - pj
+    weights = weights.clamp_min(0.0)
+    weighted_diff = diff * weights.unsqueeze(-1)
+    cov = torch.bmm(diff.transpose(1, 2), weighted_diff)
+    rhs = torch.bmm(diff.transpose(1, 2), (weights * sign).unsqueeze(-1)).squeeze(-1)
+    eye = torch.eye(3, device=points.device, dtype=points.dtype).unsqueeze(0)
+    ridge = 1e-4 * float(diff.shape[1])
+    direction = torch.linalg.solve(cov + ridge * eye, rhs.unsqueeze(-1)).squeeze(-1)
+
+    fallback = (diff * (weights * sign).unsqueeze(-1)).sum(dim=1)
+    use_fallback = direction.norm(dim=1, keepdim=True) < 1e-6
+    direction = torch.where(use_fallback, fallback, direction)
+    return F.normalize(direction, dim=1, eps=1e-6)
 
 
 def relation_metrics(pred: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
@@ -338,6 +373,8 @@ def evaluate(
     class_correct = torch.zeros(3, dtype=torch.float64)
     class_total = torch.zeros(3, dtype=torch.float64)
     errors = []
+    oracle_errors = []
+    oracle_gaps = []
 
     for points, gt_up, _cat in loader:
         points = points.to(device)
@@ -361,9 +398,20 @@ def evaluate(
         pred_up = direction_from_pair_logits(
             points, pair_i, pair_j, logits, confidence_power
         )
-        errors.append(angular_error_deg(pred_up, gt_up).detach().cpu())
+        pred_err = angular_error_deg(pred_up, gt_up)
+        oracle_up = direction_from_pair_targets(points, pair_i, pair_j, target)
+        oracle_err = angular_error_deg(oracle_up, gt_up)
+        errors.append(pred_err.detach().cpu())
+        oracle_errors.append(oracle_err.detach().cpu())
+        oracle_gaps.append((pred_err - oracle_err).detach().cpu())
 
     err = torch.cat(errors).numpy() if errors else np.asarray([], dtype=np.float32)
+    oracle_err = (
+        torch.cat(oracle_errors).numpy() if oracle_errors else np.asarray([], dtype=np.float32)
+    )
+    oracle_gap = (
+        torch.cat(oracle_gaps).numpy() if oracle_gaps else np.asarray([], dtype=np.float32)
+    )
     per_class = class_correct / class_total.clamp_min(1.0)
     return {
         "loss": total_loss / max(total_pairs, 1),
@@ -377,6 +425,10 @@ def evaluate(
         "acc10": float((err < 10).mean()) if len(err) else 0.0,
         "acc30": float((err < 30).mean()) if len(err) else 0.0,
         "flip": float((err > 90).mean()) if len(err) else 0.0,
+        "oracle_mean_err": float(oracle_err.mean()) if len(oracle_err) else float("nan"),
+        "oracle_median_err": float(np.median(oracle_err)) if len(oracle_err) else float("nan"),
+        "oracle_acc10": float((oracle_err < 10).mean()) if len(oracle_err) else 0.0,
+        "oracle_gap_mean": float(oracle_gap.mean()) if len(oracle_gap) else float("nan"),
     }
 
 
@@ -513,7 +565,8 @@ def main() -> None:
             f"lower={metrics['lower_acc']*100:.2f}% same={metrics['same_acc']*100:.2f}% "
             f"higher={metrics['higher_acc']*100:.2f}% "
             f"mean={metrics['mean_err']:.2f} median={metrics['median_err']:.2f} "
-            f"acc10={metrics['acc10']*100:.2f}% flip={metrics['flip']*100:.2f}%",
+            f"acc10={metrics['acc10']*100:.2f}% flip={metrics['flip']*100:.2f}% "
+            f"oracle10={metrics['oracle_acc10']*100:.2f}% gap={metrics['oracle_gap_mean']:.2f}",
             flush=True,
         )
 

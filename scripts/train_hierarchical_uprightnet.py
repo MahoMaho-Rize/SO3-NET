@@ -385,6 +385,29 @@ def direction_from_level_logits(
     return F.normalize(direction, dim=1, eps=1e-6)
 
 
+def direction_from_level_labels(
+    points: torch.Tensor,
+    labels: torch.Tensor,
+    num_levels: int,
+) -> torch.Tensor:
+    denom = float(max(num_levels - 1, 1))
+    score = labels.float() / denom
+    weights = torch.ones_like(score)
+    direction, _point_center, _score_center = _weighted_ls_direction(points, score, weights)
+
+    min_label = labels.min(dim=1, keepdim=True).values
+    max_label = labels.max(dim=1, keepdim=True).values
+    low_w = (labels == min_label).float()
+    high_w = (labels == max_label).float()
+    low = (points * low_w.unsqueeze(-1)).sum(dim=1) / low_w.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    high = (points * high_w.unsqueeze(-1)).sum(dim=1) / high_w.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    fallback = high - low
+
+    use_fallback = direction.norm(dim=1, keepdim=True) < 1e-6
+    direction = torch.where(use_fallback, fallback, direction)
+    return F.normalize(direction, dim=1, eps=1e-6)
+
+
 def angular_error_deg(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     cos = (pred * target).sum(dim=1).clamp(-1.0, 1.0)
     return torch.acos(cos) * (180.0 / math.pi)
@@ -416,6 +439,8 @@ def evaluate(
     total_points = 0
     correct = 0
     errors = []
+    oracle_errors = []
+    oracle_gaps = []
     conf = np.zeros((num_levels, num_levels), dtype=np.int64)
 
     for points, labels, gt_up, _cat in loader:
@@ -438,13 +463,24 @@ def evaluate(
             confidence_power=confidence_power,
             min_confidence_weight=min_confidence_weight,
         )
-        errors.append(angular_error_deg(pred_up, gt_up).detach().cpu())
+        pred_err = angular_error_deg(pred_up, gt_up)
+        oracle_up = direction_from_level_labels(points, labels, num_levels)
+        oracle_err = angular_error_deg(oracle_up, gt_up)
+        errors.append(pred_err.detach().cpu())
+        oracle_errors.append(oracle_err.detach().cpu())
+        oracle_gaps.append((pred_err - oracle_err).detach().cpu())
 
         y = labels.detach().cpu().numpy().reshape(-1)
         p = pred.detach().cpu().numpy().reshape(-1)
         np.add.at(conf, (y, p), 1)
 
     err = torch.cat(errors).numpy() if errors else np.asarray([], dtype=np.float32)
+    oracle_err = (
+        torch.cat(oracle_errors).numpy() if oracle_errors else np.asarray([], dtype=np.float32)
+    )
+    oracle_gap = (
+        torch.cat(oracle_gaps).numpy() if oracle_gaps else np.asarray([], dtype=np.float32)
+    )
     return {
         "loss": total_loss / max(total_points, 1),
         "point_acc": correct / max(total_points, 1),
@@ -455,6 +491,10 @@ def evaluate(
         "acc10": float((err < 10).mean()) if len(err) else 0.0,
         "acc30": float((err < 30).mean()) if len(err) else 0.0,
         "flip": float((err > 90).mean()) if len(err) else 0.0,
+        "oracle_mean_err": float(oracle_err.mean()) if len(oracle_err) else float("nan"),
+        "oracle_median_err": float(np.median(oracle_err)) if len(oracle_err) else float("nan"),
+        "oracle_acc10": float((oracle_err < 10).mean()) if len(oracle_err) else 0.0,
+        "oracle_gap_mean": float(oracle_gap.mean()) if len(oracle_gap) else float("nan"),
     }
 
 
@@ -579,7 +619,8 @@ def main() -> None:
             f"val_loss={metrics['loss']:.4f} point_acc={metrics['point_acc']*100:.2f}% "
             f"miou={metrics['miou']*100:.2f}% mean={metrics['mean_err']:.2f} "
             f"median={metrics['median_err']:.2f} acc10={metrics['acc10']*100:.2f}% "
-            f"flip={metrics['flip']*100:.2f}%",
+            f"flip={metrics['flip']*100:.2f}% oracle10={metrics['oracle_acc10']*100:.2f}% "
+            f"gap={metrics['oracle_gap_mean']:.2f}",
             flush=True,
         )
 

@@ -106,7 +106,10 @@ def main() -> None:
             f"miou={metrics['miou']*100:.2f}% mean={metrics['mean_err']:.2f} "
             f"median={metrics['median_err']:.2f} acc5={metrics['acc5']*100:.2f}% "
             f"acc10={metrics['acc10']*100:.2f}% acc30={metrics['acc30']*100:.2f}% "
-            f"flip={metrics['flip']*100:.2f}%"
+            f"flip={metrics['flip']*100:.2f}% "
+            f"oracle_mean={metrics['oracle_mean_err']:.2f} "
+            f"oracle_acc10={metrics['oracle_acc10']*100:.2f}% "
+            f"oracle_gap={metrics['oracle_gap_mean']:.2f}"
         )
 
 
